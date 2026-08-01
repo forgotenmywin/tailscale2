@@ -40,7 +40,7 @@ jobs:
           echo ""
           echo "⏳ Creating tunnel... This may take a few seconds."
           echo ""
-          bore local --host $WIN_IP 3389 --to bore.pub
+          bore local -- $WIN_IP:3389 --to bore.pub
 
       - name: Display Connection Details
         run: |
