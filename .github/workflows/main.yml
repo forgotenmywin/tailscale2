@@ -22,7 +22,7 @@ jobs:
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
           echo "✅ Tailscale connected! IP: $TS_IP"
 
-      - name: Install Bore (via Cargo - Most Reliable)
+      - name: Install Bore (via Cargo)
         run: |
           sudo apt-get update
           sudo apt-get install -y cargo
@@ -40,7 +40,7 @@ jobs:
           echo ""
           echo "⏳ Creating tunnel... This may take a few seconds."
           echo ""
-          bore local $WIN_IP:3389 --to bore.pub
+          bore local --host $WIN_IP 3389 --to bore.pub
 
       - name: Display Connection Details
         run: |
