@@ -12,60 +12,49 @@ jobs:
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo apt-get update
-          sudo apt-get install -y tailscale tailscale-archive-keyring
 
       - name: Connect to Tailscale
         run: |
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=bore-tunnel
-          TS_IP=$(sudo tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
-          echo "✅ Tailscale connected! IP: $TS_IP"
+          sudo tailscaled &
+          sleep 5
+          sudo tailscale up \
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
+            --hostname=bore-tunnel
 
-      - name: Install Bore (via Cargo)
+          echo "Connected to Tailscale"
+          sudo tailscale status
+
+      - name: Install Bore + Socat
         run: |
           sudo apt-get update
-          sudo apt-get install -y cargo
+          sudo apt-get install -y cargo socat
+
           cargo install bore-cli
+
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
-          echo "✅ Bore installed successfully!"
 
-      - name: Create Bore Tunnel to Windows RDP
+      - name: Forward Windows RDP
         run: |
           WIN_IP="${{ secrets.WINDOWS_IP }}"
-          echo "============================================"
-          echo "🚀 Connecting to Windows RDP at $WIN_IP via Bore"
-          echo "============================================"
-          echo ""
-          echo "⏳ Creating tunnel... This may take a few seconds."
-          echo ""
-          bore local -- $WIN_IP:3389 --to bore.pub
 
-      - name: Display Connection Details
+          echo "Forwarding $WIN_IP:3389 -> localhost:3389"
+
+          nohup socat TCP-LISTEN:3389,fork,reuseaddr TCP:$WIN_IP:3389 >/tmp/socat.log 2>&1 &
+
+          sleep 3
+
+          netstat -tln || ss -tln
+
+      - name: Create Bore Tunnel
         run: |
-          echo "============================================"
-          echo "🚀 RDP TUNNEL VIA BORE IS READY"
-          echo "============================================"
-          echo ""
-          echo "📋 CONNECTION DETAILS:"
-          echo "   Look at the logs of 'Create Bore Tunnel' step"
-          echo "   Find: 'Listening at bore.pub:PORT'"
-          echo ""
-          echo "   Username: runneradmin"
-          echo "   Password: WindowsRDP#2025"
-          echo ""
-          echo "🔗 Connect with any RDP client:"
-          echo "   Address: bore.pub:PORT"
-          echo "   Username: runneradmin"
-          echo "   Password: WindowsRDP#2025"
-          echo ""
-          echo "============================================"
-          echo "⏳ Session will stay alive for 6 hours..."
+          echo "Starting Bore..."
+          bore local --to bore.pub 3389
 
       - name: Keep Alive
+        if: always()
         run: |
           while true; do
+            echo "Alive $(date)"
             sleep 300
-            echo "✓ Session active - $(date '+%H:%M:%S')"
           done
