@@ -22,10 +22,10 @@ jobs:
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
           echo "✅ Tailscale connected! IP: $TS_IP"
 
-      - name: Install Docker & Run Guacamole
+      - name: Install Docker & Run Guacamole with PostgreSQL
         run: |
           # حذف بسته‌های قدیمی Docker
-          sudo apt-get remove -y docker docker-engine docker.io containerd runc
+          sudo apt-get remove -y docker docker-engine docker.io containerd runc 2>/dev/null || true
           
           # نصب پیش‌نیازها
           sudo apt-get update
@@ -46,11 +46,63 @@ jobs:
           sudo systemctl start docker
           sudo systemctl enable docker
           
-          # اجرای Guacamole
-          docker run -d --name guacd guacamole/guacd
-          docker run -d --name guacamole -p 8080:8080 --link guacd:guacd guacamole/guacamole
+          # ایجاد فایل docker-compose.yml
+          cat > docker-compose.yml <<EOF
+          version: '3'
+          services:
+            guacd:
+              image: guacamole/guacd
+              container_name: guacd
+              restart: always
+              networks:
+                - guac-network
+
+            postgres:
+              image: postgres:15-alpine
+              container_name: postgres
+              restart: always
+              environment:
+                POSTGRES_USER: guacamole_user
+                POSTGRES_PASSWORD: guacamole_pass
+                POSTGRES_DB: guacamole_db
+              networks:
+                - guac-network
+              volumes:
+                - pgdata:/var/lib/postgresql/data
+
+            guacamole:
+              image: guacamole/guacamole
+              container_name: guacamole
+              restart: always
+              ports:
+                - "8080:8080"
+              environment:
+                GUACD_HOSTNAME: guacd
+                POSTGRESQL_HOSTNAME: postgres
+                POSTGRESQL_DATABASE: guacamole_db
+                POSTGRESQL_USER: guacamole_user
+                POSTGRESQL_PASSWORD: guacamole_pass
+              networks:
+                - guac-network
+              depends_on:
+                - guacd
+                - postgres
+
+          networks:
+            guac-network:
+              driver: bridge
+
+          volumes:
+            pgdata:
+          EOF
           
-          echo "✅ Apache Guacamole is running on port 8080"
+          # اجرا با docker compose
+          sudo docker compose up -d
+          
+          # صبر برای راه‌اندازی کامل
+          sleep 10
+          
+          echo "✅ Apache Guacamole with PostgreSQL is running on port 8080"
 
       - name: Display Connection Details
         run: |
@@ -59,16 +111,18 @@ jobs:
           echo "============================================"
           echo ""
           echo "📋 CONNECTION DETAILS:"
-          echo "   Address: http://${{ env.TAILSCALE_IP }}:8080"
+          echo "   Address: http://${{ env.TAILSCALE_IP }}:8080/guacamole/"
           echo "   Username: guacadmin"
           echo "   Password: guacadmin"
           echo ""
           echo "🔗 Now add a connection to Windows RDP:"
-          echo "   Protocol: RDP"
-          echo "   Hostname: [IP of Windows machine from Repo 1]"
-          echo "   Port: 3389"
-          echo "   Username: runneradmin"
-          echo "   Password: WindowsRDP#2025"
+          echo "   1. Login with guacadmin/guacadmin"
+          echo "   2. Go to Settings -> Connections -> New Connection"
+          echo "   3. Protocol: RDP"
+          echo "   4. Hostname: [IP of Windows machine from Repo 1]"
+          echo "   5. Port: 3389"
+          echo "   6. Username: runneradmin"
+          echo "   7. Password: WindowsRDP#2025"
           echo ""
           echo "============================================"
           echo ""
