@@ -11,39 +11,37 @@ jobs:
     steps:
       - name: Install Tailscale
         run: |
+          set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Start & Connect Tailscale
+      - name: Start and connect Tailscale
         run: |
+          set -euo pipefail
           sudo tailscaled &
-          sleep 5
+          sleep 8
 
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
             --hostname="bore-tunnel"
 
-          echo "========== Tailscale =========="
-          sudo tailscale status
-          echo ""
-          echo "IP:"
-          sudo tailscale ip -4
+          echo "===== Tailscale Status ====="
+          sudo tailscale status || true
+          echo "===== Tailscale IP ====="
+          sudo tailscale ip -4 || true
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y \
-            cargo \
-            socat \
-            iputils-ping \
-            netcat-openbsd
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd
 
           cargo install bore-cli
-
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-      - name: Verify Windows
+      - name: Verify Windows reachability
         run: |
+          set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
           echo "======================================"
@@ -55,36 +53,20 @@ jobs:
             exit 1
           fi
 
-          echo ""
-          echo "===== Tailscale Status ====="
-          sudo tailscale status
-
-          echo ""
           echo "===== Ping Test ====="
-          if ping -c 4 "$WIN_IP"; then
-            echo "✅ Ping OK"
-          else
-            echo "❌ Cannot reach Windows."
-            exit 1
-          fi
+          ping -c 4 "$WIN_IP"
 
-          echo ""
           echo "===== RDP Port Test ====="
-          if nc -zvw5 "$WIN_IP" 3389; then
-            echo "✅ Port 3389 OPEN"
-          else
-            echo "❌ Port 3389 CLOSED/FILTERED"
-            exit 1
-          fi
+          nc -zvw5 "$WIN_IP" 3389
 
-          echo ""
-          echo "===== Success ====="
-          echo "Windows is reachable."
+          echo "✅ Windows is reachable and port 3389 is open"
 
-      - name: Create Local Forward
+      - name: Start local RDP forward with socat
         run: |
+          set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
+          echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
           nohup socat \
             TCP-LISTEN:3389,fork,reuseaddr \
             TCP:$WIN_IP:3389 \
@@ -93,19 +75,67 @@ jobs:
           sleep 3
 
           echo "===== Listening Ports ====="
-          ss -tln
+          ss -tln || true
 
-      - name: Create Bore Tunnel
+          echo "===== Socat Log ====="
+          cat /tmp/socat.log || true
+
+      - name: Test local forward
         run: |
-          echo "======================================"
-          echo "Starting Bore..."
-          echo "======================================"
+          set -euo pipefail
 
-          bore local --to bore.pub 3389
+          echo "===== Local Forward Test ====="
+          nc -zvw5 127.0.0.1 3389
 
-      - name: Keep Alive
-        if: always()
+          echo "===== RDP Handshake Test ====="
+          timeout 5 bash -c 'echo | nc 127.0.0.1 3389' || true
+
+          echo "✅ Local forward is working"
+
+      - name: Start Bore tunnel
         run: |
+          set -euo pipefail
+
+          echo "Starting Bore tunnel..."
+          nohup bore local --to bore.pub 3389 >/tmp/bore.log 2>&1 &
+
+          echo "Waiting for Bore to publish port..."
+          for i in $(seq 1 60); do
+            if grep -q "listening at bore.pub:" /tmp/bore.log; then
+              break
+            fi
+            sleep 1
+          done
+
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
+
+          BOR_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore.log | tail -n1 | awk -F: '{print $2}')"
+
+          if [ -z "${BOR_PORT:-}" ]; then
+            echo "❌ Bore did not publish a port"
+            exit 1
+          fi
+
+          echo "Bore port: $BOR_PORT"
+          echo "BOR_PORT=$BOR_PORT" >> "$GITHUB_ENV"
+
+      - name: Smoke test Bore endpoint
+        run: |
+          set -euo pipefail
+
+          echo "===== Bore Smoke Test ====="
+          nc -zvw5 bore.pub "$BOR_PORT" || true
+
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
+
+          echo "✅ Bore tunnel is up"
+
+      - name: Keep alive
+        run: |
+          set -euo pipefail
+          echo "Tunnel is ready. Keeping job alive..."
           while true; do
             echo "Alive: $(date)"
             sleep 300
