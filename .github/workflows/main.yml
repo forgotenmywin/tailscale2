@@ -13,48 +13,100 @@ jobs:
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Connect to Tailscale
+      - name: Start & Connect Tailscale
         run: |
           sudo tailscaled &
           sleep 5
+
           sudo tailscale up \
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} \
-            --hostname=bore-tunnel
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="bore-tunnel"
 
-          echo "Connected to Tailscale"
+          echo "========== Tailscale =========="
           sudo tailscale status
+          echo ""
+          echo "IP:"
+          sudo tailscale ip -4
 
-      - name: Install Bore + Socat
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cargo socat
+          sudo apt-get install -y \
+            cargo \
+            socat \
+            iputils-ping \
+            netcat-openbsd
 
           cargo install bore-cli
 
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-      - name: Forward Windows RDP
+      - name: Verify Windows
         run: |
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
-          echo "Forwarding $WIN_IP:3389 -> localhost:3389"
+          echo "======================================"
+          echo "Windows IP: $WIN_IP"
+          echo "======================================"
 
-          nohup socat TCP-LISTEN:3389,fork,reuseaddr TCP:$WIN_IP:3389 >/tmp/socat.log 2>&1 &
+          if [ -z "$WIN_IP" ]; then
+            echo "❌ WINDOWS_IP secret is empty"
+            exit 1
+          fi
+
+          echo ""
+          echo "===== Tailscale Status ====="
+          sudo tailscale status
+
+          echo ""
+          echo "===== Ping Test ====="
+          if ping -c 4 "$WIN_IP"; then
+            echo "✅ Ping OK"
+          else
+            echo "❌ Cannot reach Windows."
+            exit 1
+          fi
+
+          echo ""
+          echo "===== RDP Port Test ====="
+          if nc -zvw5 "$WIN_IP" 3389; then
+            echo "✅ Port 3389 OPEN"
+          else
+            echo "❌ Port 3389 CLOSED/FILTERED"
+            exit 1
+          fi
+
+          echo ""
+          echo "===== Success ====="
+          echo "Windows is reachable."
+
+      - name: Create Local Forward
+        run: |
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
+
+          nohup socat \
+            TCP-LISTEN:3389,fork,reuseaddr \
+            TCP:$WIN_IP:3389 \
+            >/tmp/socat.log 2>&1 &
 
           sleep 3
 
-          netstat -tln || ss -tln
+          echo "===== Listening Ports ====="
+          ss -tln
 
       - name: Create Bore Tunnel
         run: |
+          echo "======================================"
           echo "Starting Bore..."
+          echo "======================================"
+
           bore local --to bore.pub 3389
 
       - name: Keep Alive
         if: always()
         run: |
           while true; do
-            echo "Alive $(date)"
+            echo "Alive: $(date)"
             sleep 300
           done
