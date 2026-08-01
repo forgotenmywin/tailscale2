@@ -1,31 +1,65 @@
-name: Web RDP Gateway
+name: Web RDP Gateway (Ubuntu)
 
 on:
   workflow_dispatch:
 
 jobs:
   gateway:
-    runs-on: ubuntu-latest  # یا windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 360
 
     steps:
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=web-gateway
+          sudo apt-get update
+          sudo apt-get install -y tailscale tailscale-archive-keyring
 
-      - name: Run Apache Guacamole (Web RDP Client)
+      - name: Connect to Tailscale
         run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=web-gateway
+          TS_IP=$(sudo tailscale ip -4)
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "✅ Tailscale connected! IP: $TS_IP"
+
+      - name: Install Docker & Run Guacamole
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io docker-compose
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          
+          # اجرای Guacamole
           docker run -d --name guacd guacamole/guacd
           docker run -d --name guacamole -p 8080:8080 --link guacd:guacd guacamole/guacamole
+          
+          echo "✅ Apache Guacamole is running on port 8080"
 
-      - name: Keep Alive
+      - name: Display Connection Details
         run: |
           echo "============================================"
           echo "🚀 WEB RDP GATEWAY IS READY"
           echo "============================================"
-          echo "Connect to: http://$(sudo tailscale ip -4):8080"
-          echo "Username: guacadmin"
-          echo "Password: guacadmin"
+          echo ""
+          echo "📋 CONNECTION DETAILS:"
+          echo "   Address: http://${{ env.TAILSCALE_IP }}:8080"
+          echo "   Username: guacadmin"
+          echo "   Password: guacadmin"
+          echo ""
+          echo "🔗 Now add a connection to Windows RDP:"
+          echo "   Protocol: RDP"
+          echo "   Hostname: [IP of Windows machine from Repo 1]"
+          echo "   Port: 3389"
+          echo "   Username: runneradmin"
+          echo "   Password: WindowsRDP#2025"
+          echo ""
           echo "============================================"
-          while true; do sleep 300; done
+          echo ""
+          echo "⏳ Session will stay alive for 6 hours..."
+
+      - name: Keep Alive
+        run: |
+          while true; do
+            sleep 300
+            echo "✓ Session active - $(date '+%H:%M:%S')"
+          done
