@@ -1,0 +1,31 @@
+name: Web RDP Gateway
+
+on:
+  workflow_dispatch:
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest  # یا windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install Tailscale
+        run: |
+          curl -fsSL https://tailscale.com/install.sh | sh
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=web-gateway
+
+      - name: Run Apache Guacamole (Web RDP Client)
+        run: |
+          docker run -d --name guacd guacamole/guacd
+          docker run -d --name guacamole -p 8080:8080 --link guacd:guacd guacamole/guacamole
+
+      - name: Keep Alive
+        run: |
+          echo "============================================"
+          echo "🚀 WEB RDP GATEWAY IS READY"
+          echo "============================================"
+          echo "Connect to: http://$(sudo tailscale ip -4):8080"
+          echo "Username: guacadmin"
+          echo "Password: guacadmin"
+          echo "============================================"
+          while true; do sleep 300; done
