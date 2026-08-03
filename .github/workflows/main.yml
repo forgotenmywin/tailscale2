@@ -235,7 +235,7 @@ jobs:
               throw "Installer download failed."
           }
 
-          $installer | Out-File -FilePath "$env:TEMP\rustdesk-installer-path.txt" -Encoding ascii
+          Set-Content -Path (Join-Path $env:TEMP 'rustdesk-installer-path.txt') -Value $installer -Encoding ASCII
           Write-Host "Downloaded OK"
           '''
 
@@ -265,20 +265,32 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          $installerPath = Get-ChildItem "$env:TEMP\rustdesk-*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $installerPath) {
-              throw "RustDesk installer file was not found in TEMP."
+          $marker = Join-Path $env:TEMP 'rustdesk-installer-path.txt'
+          if (-not (Test-Path $marker)) {
+              throw "Installer marker file was not found: $marker"
           }
 
-          $file = $installerPath.FullName
-          Write-Host "Using installer: $file"
+          $installer = (Get-Content -Path $marker -ErrorAction Stop | Select-Object -First 1).Trim()
+          if (-not $installer) {
+              throw "Installer path inside marker file is empty."
+          }
 
-          if ($file -like "*.msi") {
+          if (-not (Test-Path $installer)) {
+              throw "Installer file does not exist: $installer"
+          }
+
+          Write-Host "Using installer: $installer"
+
+          if ($installer -like "*.msi") {
               Write-Host "Installing MSI silently..."
-              Start-Process msiexec.exe -ArgumentList @("/i", "`"$file`"", "/qn", "/norestart") -Wait -NoNewWindow
-          } else {
+              Start-Process msiexec.exe -ArgumentList @("/i", "`"$installer`"", "/qn", "/norestart") -Wait -NoNewWindow
+          }
+          elseif ($installer -like "*.exe") {
               Write-Host "Installing EXE silently..."
-              Start-Process -FilePath $file -ArgumentList "--silent-install" -Wait -NoNewWindow
+              Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait -NoNewWindow
+          }
+          else {
+              throw "Installer is neither .exe nor .msi: $installer"
           }
 
           Write-Host "Install step finished."
@@ -310,7 +322,7 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           Write-Host "Looking for RustDesk service..."
-          $svc = Get-Service | Where-Object { $_.DisplayName -match "RustDesk" -or $_.Name -match "RustDesk" } | Select-Object -First 1
+          $svc = Get-Service | Where-Object { $_.Name -match "Rust.*Desk" -or $_.DisplayName -match "Rust.*Desk" } | Select-Object -First 1
 
           if (-not $svc) {
               Write-Host "RustDesk service not found yet. Listing related processes..."
@@ -358,24 +370,38 @@ jobs:
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
-          # This step is intentionally short to avoid WinRM command-length issues.
-          ps = f'''
+          ps = r'''
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          $exe = Join-Path $env:ProgramFiles "RustDesk\\rustdesk.exe"
-          if (-not (Test-Path $exe)) {{
-              $exe = Join-Path ${env:ProgramFiles(x86)} "RustDesk\\rustdesk.exe"
-          }}
+          function Get-RustDeskExe {
+              $pf = [Environment]::GetFolderPath("ProgramFiles")
+              $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
-          if (-not (Test-Path $exe)) {{
+              $candidates = @(
+                  (Join-Path $pf "RustDesk\rustdesk.exe"),
+                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
+              )
+
+              foreach ($path in $candidates) {
+                  if ($path -and (Test-Path $path)) {
+                      return $path
+                  }
+              }
+
               throw "RustDesk executable not found."
-          }}
+          }
 
+          $exe = Get-RustDeskExe
           Write-Host "Using: $exe"
-          & $exe --password "{rustdesk_password}"
+
+          & $exe --password "<<<PWD_B64>>>"
+          if ($LASTEXITCODE -ne 0) {
+              throw "RustDesk password command failed with exit code $LASTEXITCODE"
+          }
+
           Write-Host "Password set command completed."
-          '''
+          '''.replace("<<<PWD_B64>>>", rustdesk_password)
 
           r = s.run_ps(ps)
           print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
@@ -402,15 +428,26 @@ jobs:
           ps = r'''
           $ErrorActionPreference = "Stop"
 
-          $exe = Join-Path $env:ProgramFiles "RustDesk\rustdesk.exe"
-          if (-not (Test-Path $exe)) {
-              $exe = Join-Path ${env:ProgramFiles(x86)} "RustDesk\rustdesk.exe"
-          }
+          function Get-RustDeskExe {
+              $pf = [Environment]::GetFolderPath("ProgramFiles")
+              $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
-          if (-not (Test-Path $exe)) {
+              $candidates = @(
+                  (Join-Path $pf "RustDesk\rustdesk.exe"),
+                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
+              )
+
+              foreach ($path in $candidates) {
+                  if ($path -and (Test-Path $path)) {
+                      return $path
+                  }
+              }
+
               throw "RustDesk executable not found."
           }
 
+          $exe = Get-RustDeskExe
+          Write-Host "Using: $exe"
           Write-Host "Reading RustDesk ID..."
           & $exe --get-id
           '''
@@ -419,10 +456,11 @@ jobs:
           out = r.std_out.decode("utf-8", errors="replace").strip()
           err = r.std_err.decode("utf-8", errors="replace").strip()
 
-          print("===== RustDesk ID OUTPUT =====")
-          print(out or "(empty)")
-          print("===== RustDesk STDERR =====")
-          print(err or "(empty)")
+          echo = print
+          echo("===== RustDesk ID OUTPUT =====")
+          echo(out or "(empty)")
+          echo("===== RustDesk STDERR =====")
+          echo(err or "(empty)")
 
           if r.status_code != 0:
               sys.exit(r.status_code)
@@ -445,7 +483,7 @@ jobs:
           echo ""
           echo "[3] RustDesk:"
           echo "    Installed silently on the Windows machine."
-          echo "    Open the RustDesk app and connect using the ID printed above."
+          echo "    Use the RustDesk app and connect with the ID printed above."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
