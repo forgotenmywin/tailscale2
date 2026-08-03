@@ -10,9 +10,9 @@ jobs:
 
     env:
       WINDOWS_IP: ${{ secrets.WINDOWS_IP }}
-      WINDOWS_USER: runneradmin
+      WINDOWS_USER: ${{ secrets.WINDOWS_USER }}
       WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
-      ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
+      RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
 
     steps:
       - name: Install Tailscale
@@ -195,7 +195,7 @@ jobs:
               sys.exit(r.status_code)
           PY
 
-      - name: Install AnyDesk on Windows via WinRM
+      - name: Install RustDesk on Windows via WinRM
         run: |
           set -euo pipefail
 
@@ -209,82 +209,139 @@ jobs:
           host = "http://127.0.0.1:5985/wsman"
           user = os.environ["WINDOWS_USER"]
           password = os.environ["WINDOWS_PASSWORD"]
-          anydesk_password = os.environ["ANYDESK_PASSWORD"]
+          rustdesk_password = os.environ["RUSTDESK_PASSWORD"]
 
+          if not user:
+              print("WINDOWS_USER is empty", file=sys.stderr)
+              sys.exit(1)
           if not password:
               print("WINDOWS_PASSWORD is empty", file=sys.stderr)
               sys.exit(1)
-
-          if not anydesk_password or len(anydesk_password) < 8:
-              print("ANYDESK_PASSWORD is empty or too short (min 8 chars)", file=sys.stderr)
+          if not rustdesk_password or len(rustdesk_password) < 8:
+              print("RUSTDESK_PASSWORD is empty or too short (min 8 chars)", file=sys.stderr)
               sys.exit(1)
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          pwd_b64 = base64.b64encode(anydesk_password.encode("utf-8")).decode("ascii")
+          pwd_b64 = base64.b64encode(rustdesk_password.encode("utf-8")).decode("ascii")
 
           ps_script = textwrap.dedent(f"""
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          $installer = Join-Path $env:TEMP "AnyDesk.exe"
-          $installDir = "C:\\Program Files (x86)\\AnyDesk"
-          $exe = Join-Path $installDir "AnyDesk.exe"
+          function Write-Step($msg) {{
+              Write-Host ""
+              Write-Host "==== $msg ===="
+          }}
 
-          Write-Host "Downloading AnyDesk..."
-          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $installer
+          Write-Step "Fetching latest RustDesk release"
+          $release = Invoke-RestMethod `
+            -Headers @{{ "User-Agent" = "GitHubActions" }} `
+            -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+
+          $asset = $release.assets | Where-Object {{
+              $_.name -match '^rustdesk-.*-x86_64\\.(exe|msi)$'
+          }} | Select-Object -First 1
+
+          if (-not $asset) {{
+              throw "Could not find a RustDesk x86_64 .exe or .msi asset in the latest release."
+          }}
+
+          $downloadUrl = $asset.browser_download_url
+          $fileName = $asset.name
+          $installer = Join-Path $env:TEMP $fileName
+
+          Write-Host "Asset: $fileName"
+          Write-Host "Downloading: $downloadUrl"
+
+          Invoke-WebRequest -Uri $downloadUrl -OutFile $installer
 
           if (-not (Test-Path $installer)) {{
-              throw "Installer was not downloaded."
+              throw "Installer download failed: $installer"
           }}
 
-          Write-Host "Installing AnyDesk silently..."
-          Start-Process -FilePath $installer -ArgumentList "--install `"$installDir`" --start-with-win --create-shortcuts --silent" -Wait
+          $isMsi = $fileName -like "*.msi"
+          $installDir = Join-Path $env:ProgramFiles "RustDesk"
+          $exe = Join-Path $installDir "rustdesk.exe"
 
-          Start-Sleep -Seconds 10
+          if ($isMsi) {{
+              Write-Step "Silent MSI install"
+              Start-Process msiexec.exe -ArgumentList @("/i", "`"$installer`"", "/qn", "/norestart") -Wait -NoNewWindow
+          }} else {{
+              Write-Step "Silent EXE install"
+              Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait
+          }}
+
+          Start-Sleep -Seconds 15
+
+          Write-Step "Ensuring RustDesk service exists"
+          $svc = Get-Service -Name "Rustdesk" -ErrorAction SilentlyContinue
+          if (-not $svc) {{
+              if (-not (Test-Path $exe)) {{
+                  throw "RustDesk executable not found at $exe"
+              }}
+              Set-Location $installDir
+              Start-Process -FilePath $exe -ArgumentList "--install-service" -Wait
+              Start-Sleep -Seconds 15
+              $svc = Get-Service -Name "Rustdesk" -ErrorAction SilentlyContinue
+          }}
+
+          if (-not $svc) {{
+              throw "RustDesk service was not created."
+          }}
+
+          if ($svc.Status -ne "Running") {{
+              Start-Service -Name $svc.Name
+              Start-Sleep -Seconds 5
+              $svc.Refresh()
+          }}
 
           if (-not (Test-Path $exe)) {{
-              throw "AnyDesk.exe not found at $exe"
+              throw "RustDesk executable still not found at $exe"
           }}
 
-          Write-Host "Starting AnyDesk..."
-          Start-Process -FilePath $exe -ArgumentList "--start" -Wait
+          Write-Step "Reading RustDesk ID"
+          Set-Location $installDir
+          $rustdesk_id = (& $exe --get-id | Select-Object -First 1).Trim()
 
-          Write-Host "Setting Unattended Access password..."
+          if ([string]::IsNullOrWhiteSpace($rustdesk_id)) {{
+              throw "RustDesk ID is empty."
+          }}
+
+          Write-Host "RustDesk ID: $rustdesk_id"
+
+          Write-Step "Setting permanent password"
           $pwd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{pwd_b64}"))
 
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $exe
-          $psi.Arguments = "--set-password"
-          $psi.RedirectStandardInput = $true
+          $psi.Arguments = "--password $pwd"
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
           $psi.UseShellExecute = $false
           $psi.CreateNoWindow = $true
 
           $p = [System.Diagnostics.Process]::Start($psi)
-          $p.StandardInput.WriteLine($pwd)
-          $p.StandardInput.Close()
-          $p.WaitForExit()
-
           $stdout = $p.StandardOutput.ReadToEnd()
           $stderr = $p.StandardError.ReadToEnd()
+          $p.WaitForExit()
 
-          Write-Host "===== AnyDesk command stdout ====="
+          Write-Host "===== rustdesk --password stdout ====="
           Write-Host $stdout
-          Write-Host "===== AnyDesk command stderr ====="
+          Write-Host "===== rustdesk --password stderr ====="
           Write-Host $stderr
 
           if ($p.ExitCode -ne 0) {{
-              throw "Failed to set AnyDesk password. ExitCode=$($p.ExitCode)"
+              throw "Failed to set RustDesk password. ExitCode=$($p.ExitCode)"
           }}
 
-          Write-Host "===== AnyDesk services ====="
-          Get-Service | Where-Object {{ $_.Name -like "*AnyDesk*" -or $_.DisplayName -like "*AnyDesk*" }} | Format-Table -AutoSize
+          Write-Step "Service status"
+          Get-Service | Where-Object {{ $_.Name -like "*Rustdesk*" -or $_.DisplayName -like "*RustDesk*" }} | Format-Table -AutoSize
 
-          Write-Host "AnyDesk installation and configuration finished."
+          Write-Host ""
+          Write-Host "RustDesk installation and configuration finished."
+          Write-Host "RustDesk ID: $rustdesk_id"
           """)
-
+          
           r = s.run_ps(ps_script)
 
           print("===== WinRM STDOUT =====")
@@ -309,12 +366,10 @@ jobs:
           echo "[2] WinRM (PowerShell Remoting):"
           echo "    Server:   bore.pub"
           echo "    Port:     $BOR_WINRM_PORT"
-          echo "    Username: runneradmin"
-          echo "    Use: WinRM client over HTTP/NTLM"
+          echo "    Username: $WINDOWS_USER"
           echo ""
-          echo "[3] AnyDesk:"
-          echo "    Installed silently on the Windows machine."
-          echo "    Unattended Access password was set from ANYDESK_PASSWORD."
+          echo "[3] RustDesk has been installed silently on the Windows machine."
+          echo "    Use the RustDesk app on your phone or PC, then connect to the ID printed in the WinRM log."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
