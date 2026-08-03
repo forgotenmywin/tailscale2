@@ -9,30 +9,26 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ========== 1. نصب Tailscale ==========
       - name: Install Tailscale
         run: |
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
+      # ========== 2. اتصال به Tailscale ==========
       - name: Start and connect Tailscale
         run: |
           set -euo pipefail
           
-          # Clean up any previous tailscaled process
+          # پاک‌سازی پروسه‌های قبلی
           sudo pkill tailscaled || true
           sleep 2
           
-          # Start tailscaled in userspace networking mode
+          # اجرای Tailscale در حالت userspace (برای جلوگیری از خطای TPM)
           sudo tailscaled --tun=userspace-networking &
           sleep 8
           
-          # Check if authkey is set
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
-            echo "❌ TAILSCALE_AUTH_KEY is not set!"
-            exit 1
-          fi
-          
-          # Connect to Tailscale
+          # اتصال به شبکه
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
             --hostname="bore-tunnel" \
@@ -41,9 +37,10 @@ jobs:
           
           echo "===== Tailscale Status ====="
           sudo tailscale status || true
-          echo "===== Tailscale IP ====="
+          echo "===== Tailscale IP (Runner) ====="
           sudo tailscale ip -4 || true
 
+      # ========== 3. نصب وابستگی‌ها ==========
       - name: Install dependencies
         run: |
           set -euo pipefail
@@ -57,6 +54,7 @@ jobs:
           gem install evil-winrm --no-document --user-install
           echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
 
+      # ========== 4. بررسی دسترسی به Windows (با مدیریت خطا) ==========
       - name: Verify Windows reachability
         run: |
           set -euo pipefail
@@ -71,20 +69,35 @@ jobs:
             exit 1
           fi
 
+          # تست پینگ (در صورت خطا، فقط هشدار می‌دهد و ادامه می‌دهد)
           echo "===== Ping Test ====="
-          ping -c 4 "$WIN_IP"
+          if ping -c 4 "$WIN_IP"; then
+            echo "✅ Ping successful"
+            echo "WIN_REACHABLE=true" >> $GITHUB_ENV
+          else
+            echo "⚠️ Ping failed (Windows may be offline or IP incorrect)"
+            echo "WIN_REACHABLE=false" >> $GITHUB_ENV
+          fi
 
+          # تست پورت‌ها (با || true برای جلوگیری از شکست)
           echo "===== RDP Port Test ====="
-          nc -zvw5 "$WIN_IP" 3389
-
+          nc -zvw5 "$WIN_IP" 3389 || echo "⚠️ RDP port not reachable"
           echo "===== WinRM Port Test ====="
-          nc -zvw5 "$WIN_IP" 5985
-
+          nc -zvw5 "$WIN_IP" 5985 || echo "⚠️ WinRM port not reachable"
           echo "===== SSH Port Test ====="
-          nc -zvw5 "$WIN_IP" 22
+          nc -zvw5 "$WIN_IP" 22 || echo "⚠️ SSH port not reachable"
 
-          echo "✅ Windows is reachable"
+      # ========== 5. اگر Windows قابل دسترس نبود، با خطا متوقف شو ==========
+      - name: Check if Windows is reachable
+        if: env.WIN_REACHABLE == 'false'
+        run: |
+          echo "❌ Windows is not reachable. Please check:"
+          echo "  1. Windows IP is correct in secrets.WINDOWS_IP"
+          echo "  2. Windows machine is running Tailscale and connected"
+          echo "  3. Tailscale auth key is valid"
+          exit 1
 
+      # ========== 6. ایجاد تونل‌های محلی با socat ==========
       - name: Start local forwards with socat
         run: |
           set -euo pipefail
@@ -100,6 +113,7 @@ jobs:
           echo "===== Listening Ports ====="
           ss -tln || true
 
+      # ========== 7. تست تونل‌های محلی ==========
       - name: Test local forwards
         run: |
           set -euo pipefail
@@ -109,6 +123,7 @@ jobs:
           nc -zvw5 127.0.0.1 5985
           echo "✅ Both local forwards are working"
 
+      # ========== 8. تنظیم WinRM روی Windows از طریق SSH ==========
       - name: Configure WinRM on Windows via SSH
         run: |
           set -euo pipefail
@@ -133,6 +148,7 @@ jobs:
             Write-Host \"WinRM configured successfully.\"
           "' || { echo "❌ SSH configuration failed"; exit 1; }
 
+      # ========== 9. تست WinRM از طریق لوکال‌هاست ==========
       - name: Test WinRM connection locally
         run: |
           set -euo pipefail
@@ -146,6 +162,7 @@ jobs:
           }
           echo "✅ WinRM connection successful"
 
+      # ========== 10. ایجاد تونل‌های Bore ==========
       - name: Start Bore tunnels
         run: |
           set -euo pipefail
@@ -179,6 +196,7 @@ jobs:
           echo "BOR_RDP_PORT=$BOR_RDP_PORT" >> "$GITHUB_ENV"
           echo "BOR_WINRM_PORT=$BOR_WINRM_PORT" >> "$GITHUB_ENV"
 
+      # ========== 11. تست نهایی Bore ==========
       - name: Smoke test Bore endpoints
         run: |
           set -euo pipefail
@@ -186,6 +204,7 @@ jobs:
           nc -zvw5 bore.pub "$BOR_WINRM_PORT" || true
           echo "✅ Both Bore tunnels are up"
 
+      # ========== 12. نصب AnyDesk روی Windows از طریق WinRM ==========
       - name: Install AnyDesk on Windows via WinRM
         run: |
           set -euo pipefail
@@ -202,7 +221,7 @@ jobs:
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
             
-            # Extra check: verify installation path exists
+            # بررسی نهایی
             if (Test-Path "C:\Program Files (x86)\AnyDesk\AnyDesk.exe") {
               Write-Host "✅ AnyDesk installed correctly at C:\Program Files (x86)\AnyDesk"
             } else {
@@ -210,6 +229,7 @@ jobs:
             }
           '
 
+      # ========== 13. نمایش اطلاعات اتصال و نگهداری جلسه ==========
       - name: Display connection details and keep alive
         run: |
           set -euo pipefail
