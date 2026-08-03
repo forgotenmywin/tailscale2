@@ -39,7 +39,6 @@ jobs:
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-          # Install evil-winrm with user install
           gem install evil-winrm --no-document --user-install
           echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
 
@@ -75,19 +74,13 @@ jobs:
 
           # Forward RDP
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
-          nohup socat \
-            TCP-LISTEN:3389,fork,reuseaddr \
-            TCP:$WIN_IP:3389 \
-            >/tmp/socat-rdp.log 2>&1 &
+          nohup socat -v -d -d TCP-LISTEN:3389,fork,reuseaddr TCP:$WIN_IP:3389 >/tmp/socat-rdp.log 2>&1 &
 
           # Forward WinRM
           echo "Starting socat forward: 127.0.0.1:5985 -> $WIN_IP:5985"
-          nohup socat \
-            TCP-LISTEN:5985,fork,reuseaddr \
-            TCP:$WIN_IP:5985 \
-            >/tmp/socat-winrm.log 2>&1 &
+          nohup socat -v -d -d TCP-LISTEN:5985,fork,reuseaddr TCP:$WIN_IP:5985 >/tmp/socat-winrm.log 2>&1 &
 
-          sleep 3
+          sleep 5
 
           echo "===== Listening Ports ====="
           ss -tln || true
@@ -110,15 +103,26 @@ jobs:
 
           echo "✅ Both local forwards are working"
 
+      - name: Test WinRM connection locally
+        run: |
+          set -euo pipefail
+
+          echo "Testing WinRM connection via localhost:5985..."
+          nc -zvw5 127.0.0.1 5985 || { echo "❌ Port 5985 not listening locally"; exit 1; }
+
+          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl -c 'hostname' || {
+            echo "❌ WinRM authentication failed"
+            exit 1
+          }
+          echo "✅ WinRM connection successful"
+
       - name: Start Bore tunnels
         run: |
           set -euo pipefail
 
-          # Tunnel for RDP
           echo "Starting Bore tunnel for RDP (3389)..."
           nohup bore local --to bore.pub 3389 >/tmp/bore-rdp.log 2>&1 &
 
-          # Tunnel for WinRM
           echo "Starting Bore tunnel for WinRM (5985)..."
           nohup bore local --to bore.pub 5985 >/tmp/bore-winrm.log 2>&1 &
 
@@ -170,17 +174,17 @@ jobs:
           set -euo pipefail
 
           echo "Installing AnyDesk silently on Windows via WinRM..."
-          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl -c '
+          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl --timeout 120 -c '
             $path = "C:\Windows\Temp\AnyDesk.exe"
             Write-Host "Downloading AnyDesk..."
-            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path
+            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path -TimeoutSec 60
             Write-Host "Installing AnyDesk silently..."
             Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
-            Start-Sleep -Seconds 10
+            Start-Sleep -Seconds 15
             Write-Host "Checking service status:"
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
-          ' 2>&1 | grep -v "TERM\|Useless cert"
+          '
 
       - name: Display connection details and keep alive
         run: |
