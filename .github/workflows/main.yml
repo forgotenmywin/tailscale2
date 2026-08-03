@@ -1,4 +1,4 @@
-name: RDP + WinRM Tunnel via Bore (Ubuntu)
+name: RDP Tunnel via Bore (Ubuntu)
 
 on:
   workflow_dispatch:
@@ -9,254 +9,133 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      # ========== 1. نصب Tailscale ==========
       - name: Install Tailscale
         run: |
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      # ========== 2. اتصال به Tailscale با نمایش جزئیات ==========
       - name: Start and connect Tailscale
         run: |
           set -euo pipefail
-          
-          # پاک‌سازی پروسه‌های قبلی
-          sudo pkill tailscaled || true
-          sleep 2
-          
-          # اجرای Tailscale در حالت userspace
-          sudo tailscaled --tun=userspace-networking &
+          sudo tailscaled &
           sleep 8
-          
-          # اتصال به شبکه (با نمایش خطاها)
+
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-            --hostname="bore-tunnel" \
-            --accept-routes \
-            --accept-dns=false
-          
+            --hostname="bore-tunnel"
+
           echo "===== Tailscale Status ====="
           sudo tailscale status || true
-          echo "===== Tailscale IP (Runner) ====="
+          echo "===== Tailscale IP ====="
           sudo tailscale ip -4 || true
 
-      # ========== 3. نصب وابستگی‌ها ==========
       - name: Install dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev sshpass openssh-client
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd
 
           cargo install bore-cli
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-          gem install evil-winrm --no-document --user-install
-          echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
-
-      # ========== 4. تست اتصال با استفاده از ابزار Tailscale ==========
-      - name: Debug Tailscale connection to Windows
+      - name: Verify Windows reachability
         run: |
           set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
           echo "======================================"
-          echo "Windows IP (from secret): $WIN_IP"
+          echo "Windows IP: $WIN_IP"
           echo "======================================"
 
-          # تست پینگ با استفاده از tailscale ping (اگر در دسترس باشد)
-          if command -v tailscale &> /dev/null; then
-            echo "===== Tailscale Ping ====="
-            sudo tailscale ping -c 4 "$WIN_IP" || true
+          if [ -z "$WIN_IP" ]; then
+            echo "❌ WINDOWS_IP secret is empty"
+            exit 1
           fi
 
-          # تست پینگ معمولی (با مدیریت خطا)
           echo "===== Ping Test ====="
-          if ping -c 4 "$WIN_IP"; then
-            echo "✅ Ping successful"
-            echo "WIN_REACHABLE=true" >> $GITHUB_ENV
-          else
-            echo "⚠️ Ping failed - Windows may be offline, IP incorrect, or Tailscale not connected"
-            echo "WIN_REACHABLE=false" >> $GITHUB_ENV
-          fi
+          ping -c 4 "$WIN_IP"
 
-          # تست پورت‌ها (با || true)
           echo "===== RDP Port Test ====="
-          nc -zvw5 "$WIN_IP" 3389 || echo "⚠️ RDP port not reachable"
-          echo "===== WinRM Port Test ====="
-          nc -zvw5 "$WIN_IP" 5985 || echo "⚠️ WinRM port not reachable"
-          echo "===== SSH Port Test ====="
-          nc -zvw5 "$WIN_IP" 22 || echo "⚠️ SSH port not reachable"
+          nc -zvw5 "$WIN_IP" 3389
 
-      # ========== 5. اگر Windows قابل دسترس نبود، با پیام راهنما متوقف شو ==========
-      - name: Check if Windows is reachable
-        if: env.WIN_REACHABLE == 'false'
-        run: |
-          echo "❌ Windows is not reachable. Please check:"
-          echo "  1️⃣ On Windows machine, run: tailscale status (must be 'Connected')"
-          echo "  2️⃣ On Windows machine, run: tailscale ip -4 (update WINDOWS_IP secret)"
-          echo "  3️⃣ In GitHub Secrets, ensure TAILSCALE_AUTH_KEY is valid and Reusable"
-          echo "  4️⃣ Verify Tailscale is running on both sides (Windows and Ubuntu runner)"
-          echo ""
-          echo "🔍 Check Tailscale status on runner (from previous step logs)."
-          exit 1
+          echo "✅ Windows is reachable and port 3389 is open"
 
-      # ========== 6. ایجاد تونل‌های محلی با socat ==========
-      - name: Start local forwards with socat
+      - name: Start local RDP forward with socat
         run: |
           set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
-          nohup socat -v -d -d TCP-LISTEN:3389,fork,reuseaddr TCP:$WIN_IP:3389 >/tmp/socat-rdp.log 2>&1 &
+          nohup socat \
+            TCP-LISTEN:3389,fork,reuseaddr \
+            TCP:$WIN_IP:3389 \
+            >/tmp/socat.log 2>&1 &
 
-          echo "Starting socat forward: 127.0.0.1:5985 -> $WIN_IP:5985"
-          nohup socat -v -d -d TCP-LISTEN:5985,fork,reuseaddr TCP:$WIN_IP:5985 >/tmp/socat-winrm.log 2>&1 &
+          sleep 3
 
-          sleep 5
           echo "===== Listening Ports ====="
           ss -tln || true
 
-      # ========== 7. تست تونل‌های محلی ==========
-      - name: Test local forwards
+          echo "===== Socat Log ====="
+          cat /tmp/socat.log || true
+
+      - name: Test local forward
         run: |
           set -euo pipefail
-          echo "===== Local RDP Forward Test ====="
+
+          echo "===== Local Forward Test ====="
           nc -zvw5 127.0.0.1 3389
-          echo "===== Local WinRM Forward Test ====="
-          nc -zvw5 127.0.0.1 5985
-          echo "✅ Both local forwards are working"
 
-      # ========== 8. تنظیم WinRM روی Windows از طریق SSH ==========
-      - name: Configure WinRM on Windows via SSH
-        run: |
-          set -euo pipefail
-          WIN_IP="${{ secrets.WINDOWS_IP }}"
+          echo "===== RDP Handshake Test ====="
+          timeout 5 bash -c 'echo | nc 127.0.0.1 3389' || true
 
-          echo "Configuring WinRM on Windows via SSH..."
-          sshpass -p 'WindowsRDP#2025' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "runneradmin@$WIN_IP" -p 22 'powershell -Command "
-            # Enable WinRM
-            Enable-PSRemoting -Force
-            # Allow Basic authentication
-            Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true -Force
-            # Allow unencrypted traffic (since we use Tailscale tunnel)
-            Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true -Force
-            # Set TrustedHosts to * (allow all)
-            Set-Item WSMan:\localhost\Client\TrustedHosts -Value \"*\" -Force
-            # Restart WinRM service
-            Restart-Service WinRM -Force
-            # Add firewall rule for WinRM (just in case)
-            New-NetFirewallRule -Name \"WinRM-HTTP-In-TCP\" -DisplayName \"WinRM HTTP\" -Enabled True -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -ErrorAction SilentlyContinue
-            # Add runneradmin to WinRM group
-            Add-LocalGroupMember -Group \"WinRMRemoteWMIUsers__\" -Member \"runneradmin\" -ErrorAction SilentlyContinue
-            Write-Host \"WinRM configured successfully.\"
-          "' || { echo "❌ SSH configuration failed"; exit 1; }
+          echo "✅ Local forward is working"
 
-      # ========== 9. تست WinRM از طریق لوکال‌هاست ==========
-      - name: Test WinRM connection locally
+      - name: Start Bore tunnel
         run: |
           set -euo pipefail
 
-          echo "Testing WinRM connection via localhost:5985..."
-          nc -zvw5 127.0.0.1 5985 || { echo "❌ Port 5985 not listening locally"; exit 1; }
+          echo "Starting Bore tunnel..."
+          nohup bore local --to bore.pub 3389 >/tmp/bore.log 2>&1 &
 
-          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl -c 'hostname' || {
-            echo "❌ WinRM authentication failed"
-            exit 1
-          }
-          echo "✅ WinRM connection successful"
-
-      # ========== 10. ایجاد تونل‌های Bore ==========
-      - name: Start Bore tunnels
-        run: |
-          set -euo pipefail
-
-          echo "Starting Bore tunnel for RDP (3389)..."
-          nohup bore local --to bore.pub 3389 >/tmp/bore-rdp.log 2>&1 &
-
-          echo "Starting Bore tunnel for WinRM (5985)..."
-          nohup bore local --to bore.pub 5985 >/tmp/bore-winrm.log 2>&1 &
-
-          echo "Waiting for Bore to publish ports..."
+          echo "Waiting for Bore to publish port..."
           for i in $(seq 1 60); do
-            if grep -q "listening at bore.pub:" /tmp/bore-rdp.log && grep -q "listening at bore.pub:" /tmp/bore-winrm.log; then
+            if grep -q "listening at bore.pub:" /tmp/bore.log; then
               break
             fi
             sleep 1
           done
 
-          echo "===== Bore Logs ====="
-          cat /tmp/bore-rdp.log || true
-          cat /tmp/bore-winrm.log || true
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
 
-          BOR_RDP_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-rdp.log | tail -n1 | awk -F: '{print $2}')"
-          BOR_WINRM_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-winrm.log | tail -n1 | awk -F: '{print $2}')"
+          BOR_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore.log | tail -n1 | awk -F: '{print $2}')"
 
-          if [ -z "${BOR_RDP_PORT:-}" ] || [ -z "${BOR_WINRM_PORT:-}" ]; then
-            echo "❌ Bore did not publish ports"
+          if [ -z "${BOR_PORT:-}" ]; then
+            echo "❌ Bore did not publish a port"
             exit 1
           fi
 
-          echo "BOR_RDP_PORT=$BOR_RDP_PORT" >> "$GITHUB_ENV"
-          echo "BOR_WINRM_PORT=$BOR_WINRM_PORT" >> "$GITHUB_ENV"
+          echo "Bore port: $BOR_PORT"
+          echo "BOR_PORT=$BOR_PORT" >> "$GITHUB_ENV"
 
-      # ========== 11. تست نهایی Bore ==========
-      - name: Smoke test Bore endpoints
-        run: |
-          set -euo pipefail
-          nc -zvw5 bore.pub "$BOR_RDP_PORT" || true
-          nc -zvw5 bore.pub "$BOR_WINRM_PORT" || true
-          echo "✅ Both Bore tunnels are up"
-
-      # ========== 12. نصب AnyDesk روی Windows از طریق WinRM ==========
-      - name: Install AnyDesk on Windows via WinRM
+      - name: Smoke test Bore endpoint
         run: |
           set -euo pipefail
 
-          echo "Installing AnyDesk silently on Windows via WinRM..."
-          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl --timeout 120 -c '
-            $path = "C:\Windows\Temp\AnyDesk.exe"
-            Write-Host "Downloading AnyDesk..."
-            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path -TimeoutSec 60
-            Write-Host "Installing AnyDesk silently..."
-            Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
-            Start-Sleep -Seconds 10
-            Write-Host "Checking service status:"
-            Get-Service AnyDesk* | Format-List
-            Write-Host "AnyDesk installation finished successfully!"
-            
-            if (Test-Path "C:\Program Files (x86)\AnyDesk\AnyDesk.exe") {
-              Write-Host "✅ AnyDesk installed correctly at C:\Program Files (x86)\AnyDesk"
-            } else {
-              Write-Host "⚠️ AnyDesk installation might have failed - binary not found"
-            }
-          '
+          echo "===== Bore Smoke Test ====="
+          nc -zvw5 bore.pub "$BOR_PORT" || true
 
-      # ========== 13. نمایش اطلاعات اتصال و نگهداری جلسه ==========
-      - name: Display connection details and keep alive
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
+
+          echo "✅ Bore tunnel is up"
+
+      - name: Keep alive
         run: |
           set -euo pipefail
-          echo "============================================================"
-          echo "        TUNNEL CONNECTION DETAILS (via bore.pub)            "
-          echo "============================================================"
-          echo ""
-          echo "[1] RDP (Remote Desktop):"
-          echo "    Address: bore.pub:$BOR_RDP_PORT"
-          echo ""
-          echo "[2] WinRM (PowerShell Remoting):"
-          echo "    Server:   bore.pub"
-          echo "    Port:     $BOR_WINRM_PORT"
-          echo "    Username: runneradmin"
-          echo "    Password: WindowsRDP#2025"
-          echo ""
-          echo "Example using evil-winrm:"
-          echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
-          echo ""
-          echo "[3] AnyDesk has been installed silently on the Windows machine."
-          echo "    You can now connect using AnyDesk (check the service status)."
-          echo ""
-          echo "============================================================"
-          echo "Tunnel is ready. Keeping job alive for 6 hours..."
+          echo "Tunnel is ready. Keeping job alive..."
           while true; do
             echo "Alive: $(date)"
             sleep 300
