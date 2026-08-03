@@ -10,8 +10,7 @@ jobs:
 
     env:
       WINDOWS_IP: ${{ secrets.WINDOWS_IP }}
-      WINDOWS_USER: ${{ secrets.WINDOWS_USER }}
-      WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
       RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
 
     steps:
@@ -27,7 +26,7 @@ jobs:
           sleep 8
 
           sudo tailscale up \
-            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="bore-tunnel"
 
           echo "===== Tailscale Status ====="
@@ -51,7 +50,7 @@ jobs:
       - name: Verify Windows reachability
         run: |
           set -euo pipefail
-          WIN_IP="${WINDOWS_IP}"
+          WIN_IP="$WINDOWS_IP"
 
           echo "======================================"
           echo "Windows IP: $WIN_IP"
@@ -71,12 +70,12 @@ jobs:
           echo "===== WinRM Port Test ====="
           nc -zvw5 "$WIN_IP" 5985
 
-          echo "✅ Windows is reachable, ports 3389 (RDP) and 5985 (WinRM) are open"
+          echo "✅ Windows is reachable, ports 3389 and 5985 are open"
 
       - name: Start local forwards with socat
         run: |
           set -euo pipefail
-          WIN_IP="${WINDOWS_IP}"
+          WIN_IP="$WINDOWS_IP"
 
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
           nohup socat \
@@ -91,39 +90,16 @@ jobs:
             >/tmp/socat-winrm.log 2>&1 &
 
           sleep 3
-
-          echo "===== Listening Ports ====="
           ss -tln || true
-
-          echo "===== Socat Logs ====="
-          echo "RDP log:"
-          cat /tmp/socat-rdp.log || true
-          echo "WinRM log:"
-          cat /tmp/socat-winrm.log || true
-
-      - name: Test local forwards
-        run: |
-          set -euo pipefail
-
-          echo "===== Local RDP Forward Test ====="
-          nc -zvw5 127.0.0.1 3389
-
-          echo "===== Local WinRM Forward Test ====="
-          nc -zvw5 127.0.0.1 5985
-
-          echo "✅ Both local forwards are working"
 
       - name: Start Bore tunnels
         run: |
           set -euo pipefail
 
-          echo "Starting Bore tunnel for RDP (3389)..."
           nohup bore local --to bore.pub 3389 >/tmp/bore-rdp.log 2>&1 &
-
-          echo "Starting Bore tunnel for WinRM (5985)..."
           nohup bore local --to bore.pub 5985 >/tmp/bore-winrm.log 2>&1 &
 
-          echo "Waiting for Bore to publish ports..."
+          echo "Waiting for Bore ports..."
           for i in $(seq 1 60); do
             if grep -q "listening at bore.pub:" /tmp/bore-rdp.log && grep -q "listening at bore.pub:" /tmp/bore-winrm.log; then
               break
@@ -131,53 +107,39 @@ jobs:
             sleep 1
           done
 
-          echo "===== Bore Logs ====="
-          echo "RDP Bore log:"
-          cat /tmp/bore-rdp.log || true
-          echo "WinRM Bore log:"
-          cat /tmp/bore-winrm.log || true
-
           BOR_RDP_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-rdp.log | tail -n1 | awk -F: '{print $2}')"
           BOR_WINRM_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-winrm.log | tail -n1 | awk -F: '{print $2}')"
 
-          if [ -z "${BOR_RDP_PORT:-}" ]; then
-            echo "❌ Bore did not publish a port for RDP"
-            exit 1
-          fi
-          if [ -z "${BOR_WINRM_PORT:-}" ]; then
-            echo "❌ Bore did not publish a port for WinRM"
+          if [ -z "${BOR_RDP_PORT:-}" ] || [ -z "${BOR_WINRM_PORT:-}" ]; then
+            echo "❌ Bore did not publish ports"
+            echo "RDP log:"
+            cat /tmp/bore-rdp.log || true
+            echo "WinRM log:"
+            cat /tmp/bore-winrm.log || true
             exit 1
           fi
 
-          echo "Bore RDP port: $BOR_RDP_PORT"
-          echo "Bore WinRM port: $BOR_WINRM_PORT"
           echo "BOR_RDP_PORT=$BOR_RDP_PORT" >> "$GITHUB_ENV"
           echo "BOR_WINRM_PORT=$BOR_WINRM_PORT" >> "$GITHUB_ENV"
 
       - name: Smoke test Bore endpoints
         run: |
           set -euo pipefail
-
-          echo "===== Bore Smoke Test (RDP) ====="
           nc -zvw5 bore.pub "$BOR_RDP_PORT" || true
-
-          echo "===== Bore Smoke Test (WinRM) ====="
           nc -zvw5 bore.pub "$BOR_WINRM_PORT" || true
-
-          echo "✅ Both Bore tunnels are up"
+          echo "✅ Bore tunnels are up"
 
       - name: Test WinRM from GitHub runner
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           print("Connecting to WinRM...")
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
@@ -200,17 +162,12 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
-
-          if not user or not password:
-              print("WINDOWS_USER or WINDOWS_PASSWORD is empty", file=sys.stderr)
-              sys.exit(1)
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -218,9 +175,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
           $bootstrap = @'
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
           $release = Invoke-RestMethod -Headers @{ "User-Agent" = "GitHubActions" } -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
 
@@ -245,18 +205,12 @@ jobs:
           '@
 
           Set-Content -Path "C:\Windows\Temp\rustdesk_bootstrap.ps1" -Value $bootstrap -Encoding UTF8
-          Write-Host "Bootstrap script written to C:\Windows\Temp\rustdesk_bootstrap.ps1"
+          Write-Host "Bootstrap script written."
           '''
 
           r = s.run_ps(ps)
-          stdout = r.std_out.decode("utf-8", errors="replace")
-          stderr = r.std_err.decode("utf-8", errors="replace")
-
-          print("===== STDOUT =====")
-          print(stdout or "(empty)")
-          print("===== STDERR =====")
-          print(stderr or "(empty)")
-
+          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
+          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
           if r.status_code != 0:
               sys.exit(r.status_code)
           PY
@@ -266,13 +220,12 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -299,13 +252,12 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -359,13 +311,12 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -405,18 +356,21 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
+          import base64
           import sys
           import winrm
+          import os
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
           rustdesk_password = os.environ["RUSTDESK_PASSWORD"]
 
           if not rustdesk_password or len(rustdesk_password) < 8:
               print("RUSTDESK_PASSWORD is empty or too short (min 8 chars).", file=sys.stderr)
               sys.exit(1)
+
+          pwd_b64 = base64.b64encode(rustdesk_password.encode("utf-8")).decode("ascii")
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -445,7 +399,8 @@ jobs:
           $exe = Get-RustDeskExe
           Write-Host "Using: $exe"
 
-          & $exe --password "{rustdesk_password}"
+          $pwd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{pwd_b64}"))
+          & $exe --password $pwd
           if ($LASTEXITCODE -ne 0) {{
               throw "RustDesk password command failed with exit code $LASTEXITCODE"
           }}
@@ -465,13 +420,12 @@ jobs:
           set -euo pipefail
 
           python3 - <<'PY'
-          import os
           import sys
           import winrm
 
           host = "http://127.0.0.1:5985/wsman"
-          user = os.environ["WINDOWS_USER"]
-          password = os.environ["WINDOWS_PASSWORD"]
+          user = "runneradmin"
+          password = "WindowsRDP#2025"
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
@@ -483,8 +437,8 @@ jobs:
               $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
               $candidates = @(
-                  (Join-Path $pf "RustDesk\\rustdesk.exe"),
-                  (Join-Path $pf86 "RustDesk\\rustdesk.exe")
+                  (Join-Path $pf "RustDesk\rustdesk.exe"),
+                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
               )
 
               foreach ($path in $candidates) {
@@ -528,7 +482,7 @@ jobs:
           echo "[2] WinRM (PowerShell Remoting):"
           echo "    Server:   bore.pub"
           echo "    Port:     $BOR_WINRM_PORT"
-          echo "    Username: $WINDOWS_USER"
+          echo "    Username: runneradmin"
           echo ""
           echo "[3] RustDesk:"
           echo "    Installed silently on the Windows machine."
