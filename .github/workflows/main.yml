@@ -15,7 +15,7 @@ jobs:
           set -euo pipefail
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      # ========== 2. اتصال به Tailscale ==========
+      # ========== 2. اتصال به Tailscale با نمایش جزئیات ==========
       - name: Start and connect Tailscale
         run: |
           set -euo pipefail
@@ -24,11 +24,11 @@ jobs:
           sudo pkill tailscaled || true
           sleep 2
           
-          # اجرای Tailscale در حالت userspace (برای جلوگیری از خطای TPM)
+          # اجرای Tailscale در حالت userspace
           sudo tailscaled --tun=userspace-networking &
           sleep 8
           
-          # اتصال به شبکه
+          # اتصال به شبکه (با نمایش خطاها)
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
             --hostname="bore-tunnel" \
@@ -54,32 +54,33 @@ jobs:
           gem install evil-winrm --no-document --user-install
           echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
 
-      # ========== 4. بررسی دسترسی به Windows (با مدیریت خطا) ==========
-      - name: Verify Windows reachability
+      # ========== 4. تست اتصال با استفاده از ابزار Tailscale ==========
+      - name: Debug Tailscale connection to Windows
         run: |
           set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
           echo "======================================"
-          echo "Windows IP: $WIN_IP"
+          echo "Windows IP (from secret): $WIN_IP"
           echo "======================================"
 
-          if [ -z "$WIN_IP" ]; then
-            echo "❌ WINDOWS_IP secret is empty"
-            exit 1
+          # تست پینگ با استفاده از tailscale ping (اگر در دسترس باشد)
+          if command -v tailscale &> /dev/null; then
+            echo "===== Tailscale Ping ====="
+            sudo tailscale ping -c 4 "$WIN_IP" || true
           fi
 
-          # تست پینگ (در صورت خطا، فقط هشدار می‌دهد و ادامه می‌دهد)
+          # تست پینگ معمولی (با مدیریت خطا)
           echo "===== Ping Test ====="
           if ping -c 4 "$WIN_IP"; then
             echo "✅ Ping successful"
             echo "WIN_REACHABLE=true" >> $GITHUB_ENV
           else
-            echo "⚠️ Ping failed (Windows may be offline or IP incorrect)"
+            echo "⚠️ Ping failed - Windows may be offline, IP incorrect, or Tailscale not connected"
             echo "WIN_REACHABLE=false" >> $GITHUB_ENV
           fi
 
-          # تست پورت‌ها (با || true برای جلوگیری از شکست)
+          # تست پورت‌ها (با || true)
           echo "===== RDP Port Test ====="
           nc -zvw5 "$WIN_IP" 3389 || echo "⚠️ RDP port not reachable"
           echo "===== WinRM Port Test ====="
@@ -87,14 +88,17 @@ jobs:
           echo "===== SSH Port Test ====="
           nc -zvw5 "$WIN_IP" 22 || echo "⚠️ SSH port not reachable"
 
-      # ========== 5. اگر Windows قابل دسترس نبود، با خطا متوقف شو ==========
+      # ========== 5. اگر Windows قابل دسترس نبود، با پیام راهنما متوقف شو ==========
       - name: Check if Windows is reachable
         if: env.WIN_REACHABLE == 'false'
         run: |
           echo "❌ Windows is not reachable. Please check:"
-          echo "  1. Windows IP is correct in secrets.WINDOWS_IP"
-          echo "  2. Windows machine is running Tailscale and connected"
-          echo "  3. Tailscale auth key is valid"
+          echo "  1️⃣ On Windows machine, run: tailscale status (must be 'Connected')"
+          echo "  2️⃣ On Windows machine, run: tailscale ip -4 (update WINDOWS_IP secret)"
+          echo "  3️⃣ In GitHub Secrets, ensure TAILSCALE_AUTH_KEY is valid and Reusable"
+          echo "  4️⃣ Verify Tailscale is running on both sides (Windows and Ubuntu runner)"
+          echo ""
+          echo "🔍 Check Tailscale status on runner (from previous step logs)."
           exit 1
 
       # ========== 6. ایجاد تونل‌های محلی با socat ==========
@@ -221,7 +225,6 @@ jobs:
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
             
-            # بررسی نهایی
             if (Test-Path "C:\Program Files (x86)\AnyDesk\AnyDesk.exe") {
               Write-Host "✅ AnyDesk installed correctly at C:\Program Files (x86)\AnyDesk"
             } else {
