@@ -17,13 +17,28 @@ jobs:
       - name: Start and connect Tailscale
         run: |
           set -euo pipefail
-          sudo tailscaled &
+          
+          # Clean up any previous tailscaled process
+          sudo pkill tailscaled || true
+          sleep 2
+          
+          # Start tailscaled in userspace networking mode
+          sudo tailscaled --tun=userspace-networking &
           sleep 8
-
+          
+          # Check if authkey is set
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "❌ TAILSCALE_AUTH_KEY is not set!"
+            exit 1
+          fi
+          
+          # Connect to Tailscale
           sudo tailscale up \
             --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
-            --hostname="bore-tunnel"
-
+            --hostname="bore-tunnel" \
+            --accept-routes \
+            --accept-dns=false
+          
           echo "===== Tailscale Status ====="
           sudo tailscale status || true
           echo "===== Tailscale IP ====="
