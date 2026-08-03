@@ -186,6 +186,13 @@ jobs:
             Write-Host "Checking service status:"
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
+            
+            # Extra check: verify installation path exists
+            if (Test-Path "C:\Program Files (x86)\AnyDesk\AnyDesk.exe") {
+              Write-Host "✅ AnyDesk installed correctly at C:\Program Files (x86)\AnyDesk"
+            } else {
+              Write-Host "⚠️ AnyDesk installation might have failed - binary not found"
+            }
           '
 
       - name: Display connection details and keep alive
@@ -207,7 +214,9 @@ jobs:
           echo "Example using evil-winrm:"
           echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
           echo ""
-          echo "[3] AnyDesk has been installed silently."
+          echo "[3] AnyDesk has been installed silently on the Windows machine."
+          echo "    You can now connect using AnyDesk (check the service status)."
+          echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
           while true; do
