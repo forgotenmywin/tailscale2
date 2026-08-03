@@ -166,6 +166,35 @@ jobs:
 
           echo "✅ Both Bore tunnels are up"
 
+      - name: Test WinRM from GitHub runner
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import sys
+          import winrm
+
+          host = "http://127.0.0.1:5985/wsman"
+          user = os.environ["WINDOWS_USER"]
+          password = os.environ["WINDOWS_PASSWORD"]
+
+          print("Connecting to WinRM...")
+          s = winrm.Session(host, auth=(user, password), transport="ntlm")
+
+          print("Running hostname...")
+          r = s.run_cmd("hostname")
+
+          print("STATUS:", r.status_code)
+          print("STDOUT:")
+          print(r.std_out.decode("utf-8", errors="replace"))
+          print("STDERR:")
+          print(r.std_err.decode("utf-8", errors="replace"))
+
+          if r.status_code != 0:
+              sys.exit(r.status_code)
+          PY
+
       - name: Install AnyDesk on Windows via WinRM
         run: |
           set -euo pipefail
@@ -177,7 +206,7 @@ jobs:
           import textwrap
           import winrm
 
-          host = "127.0.0.1:5985"
+          host = "http://127.0.0.1:5985/wsman"
           user = os.environ["WINDOWS_USER"]
           password = os.environ["WINDOWS_PASSWORD"]
           anydesk_password = os.environ["ANYDESK_PASSWORD"]
@@ -185,24 +214,29 @@ jobs:
           if not password:
               print("WINDOWS_PASSWORD is empty", file=sys.stderr)
               sys.exit(1)
-          if not anydesk_password:
-              print("ANYDESK_PASSWORD is empty", file=sys.stderr)
+
+          if not anydesk_password or len(anydesk_password) < 8:
+              print("ANYDESK_PASSWORD is empty or too short (min 8 chars)", file=sys.stderr)
               sys.exit(1)
 
-          # Safe transport for a local Windows account over WinRM.
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
           pwd_b64 = base64.b64encode(anydesk_password.encode("utf-8")).decode("ascii")
 
           ps_script = textwrap.dedent(f"""
           $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
 
-          $installer = "C:\\Windows\\Temp\\AnyDesk.exe"
+          $installer = Join-Path $env:TEMP "AnyDesk.exe"
           $installDir = "C:\\Program Files (x86)\\AnyDesk"
           $exe = Join-Path $installDir "AnyDesk.exe"
 
           Write-Host "Downloading AnyDesk..."
           Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $installer
+
+          if (-not (Test-Path $installer)) {{
+              throw "Installer was not downloaded."
+          }}
 
           Write-Host "Installing AnyDesk silently..."
           Start-Process -FilePath $installer -ArgumentList "--install `"$installDir`" --start-with-win --create-shortcuts --silent" -Wait
@@ -213,7 +247,7 @@ jobs:
               throw "AnyDesk.exe not found at $exe"
           }}
 
-          Write-Host "Starting AnyDesk service/client..."
+          Write-Host "Starting AnyDesk..."
           Start-Process -FilePath $exe -ArgumentList "--start" -Wait
 
           Write-Host "Setting Unattended Access password..."
@@ -221,7 +255,7 @@ jobs:
 
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $exe
-          $psi.Arguments = "--set-password _unattended_access"
+          $psi.Arguments = "--set-password"
           $psi.RedirectStandardInput = $true
           $psi.RedirectStandardOutput = $true
           $psi.RedirectStandardError = $true
@@ -236,24 +270,27 @@ jobs:
           $stdout = $p.StandardOutput.ReadToEnd()
           $stderr = $p.StandardError.ReadToEnd()
 
+          Write-Host "===== AnyDesk command stdout ====="
+          Write-Host $stdout
+          Write-Host "===== AnyDesk command stderr ====="
+          Write-Host $stderr
+
           if ($p.ExitCode -ne 0) {{
-              throw "Failed to set password. ExitCode=$($p.ExitCode) STDOUT=$stdout STDERR=$stderr"
+              throw "Failed to set AnyDesk password. ExitCode=$($p.ExitCode)"
           }}
 
-          Write-Host "===== AnyDesk Services ====="
+          Write-Host "===== AnyDesk services ====="
           Get-Service | Where-Object {{ $_.Name -like "*AnyDesk*" -or $_.DisplayName -like "*AnyDesk*" }} | Format-Table -AutoSize
 
           Write-Host "AnyDesk installation and configuration finished."
           """)
 
           r = s.run_ps(ps_script)
-          stdout = r.std_out.decode("utf-8", errors="replace")
-          stderr = r.std_err.decode("utf-8", errors="replace")
 
           print("===== WinRM STDOUT =====")
-          print(stdout or "(empty)")
+          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
           print("===== WinRM STDERR =====")
-          print(stderr or "(empty)")
+          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
 
           if r.status_code != 0:
               raise SystemExit(r.status_code)
@@ -273,12 +310,11 @@ jobs:
           echo "    Server:   bore.pub"
           echo "    Port:     $BOR_WINRM_PORT"
           echo "    Username: runneradmin"
-          echo "    (Use with any WinRM client)"
+          echo "    Use: WinRM client over HTTP/NTLM"
           echo ""
-          echo "[3] AnyDesk has been installed silently on the Windows machine."
-          echo "    Standard AnyDesk installs typically live at:"
-          echo "    C:\\Program Files (x86)\\AnyDesk\\AnyDesk.exe"
-          echo "    and AnyDesk supports setting unattended access from the CLI."
+          echo "[3] AnyDesk:"
+          echo "    Installed silently on the Windows machine."
+          echo "    Unattended Access password was set from ANYDESK_PASSWORD."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
