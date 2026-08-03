@@ -8,6 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
+    env:
+      WINDOWS_IP: ${{ secrets.WINDOWS_IP }}
+      WINDOWS_USER: runneradmin
+      WINDOWS_PASSWORD: ${{ secrets.WINDOWS_PASSWORD }}
+      ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
+
     steps:
       - name: Install Tailscale
         run: |
@@ -33,20 +39,19 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd python3 python3-pip
 
           cargo install bore-cli
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-          # Install evil-winrm with user install to avoid permission errors
-          gem install evil-winrm --no-document --user-install
-          echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pywinrm
 
       - name: Verify Windows reachability
         run: |
           set -euo pipefail
-          WIN_IP="${{ secrets.WINDOWS_IP }}"
+          WIN_IP="${WINDOWS_IP}"
 
           echo "======================================"
           echo "Windows IP: $WIN_IP"
@@ -58,7 +63,7 @@ jobs:
           fi
 
           echo "===== Ping Test ====="
-          ping -c 4 "$WIN_IP"
+          ping -c 4 "$WIN_IP" || true
 
           echo "===== RDP Port Test ====="
           nc -zvw5 "$WIN_IP" 3389
@@ -71,16 +76,14 @@ jobs:
       - name: Start local forwards with socat
         run: |
           set -euo pipefail
-          WIN_IP="${{ secrets.WINDOWS_IP }}"
+          WIN_IP="${WINDOWS_IP}"
 
-          # Forward RDP
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
           nohup socat \
             TCP-LISTEN:3389,fork,reuseaddr \
             TCP:$WIN_IP:3389 \
             >/tmp/socat-rdp.log 2>&1 &
 
-          # Forward WinRM
           echo "Starting socat forward: 127.0.0.1:5985 -> $WIN_IP:5985"
           nohup socat \
             TCP-LISTEN:5985,fork,reuseaddr \
@@ -114,11 +117,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Tunnel for RDP
           echo "Starting Bore tunnel for RDP (3389)..."
           nohup bore local --to bore.pub 3389 >/tmp/bore-rdp.log 2>&1 &
 
-          # Tunnel for WinRM
           echo "Starting Bore tunnel for WinRM (5985)..."
           nohup bore local --to bore.pub 5985 >/tmp/bore-winrm.log 2>&1 &
 
@@ -169,19 +170,94 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Installing AnyDesk silently on Windows via WinRM..."
-          # Set TERM to avoid warnings and disable SSL explicitly
-          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' -c '
-            $path = "C:\Windows\Temp\AnyDesk.exe"
-            Write-Host "Downloading AnyDesk..."
-            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path
-            Write-Host "Installing AnyDesk silently..."
-            Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
-            Start-Sleep -Seconds 10
-            Write-Host "Checking service status:"
-            Get-Service AnyDesk* | Format-List
-            Write-Host "AnyDesk installation finished successfully!"
-          ' 2>/dev/null || true
+          python3 - <<'PY'
+          import base64
+          import os
+          import sys
+          import textwrap
+          import winrm
+
+          host = "127.0.0.1:5985"
+          user = os.environ["WINDOWS_USER"]
+          password = os.environ["WINDOWS_PASSWORD"]
+          anydesk_password = os.environ["ANYDESK_PASSWORD"]
+
+          if not password:
+              print("WINDOWS_PASSWORD is empty", file=sys.stderr)
+              sys.exit(1)
+          if not anydesk_password:
+              print("ANYDESK_PASSWORD is empty", file=sys.stderr)
+              sys.exit(1)
+
+          # Safe transport for a local Windows account over WinRM.
+          s = winrm.Session(host, auth=(user, password), transport="ntlm")
+
+          pwd_b64 = base64.b64encode(anydesk_password.encode("utf-8")).decode("ascii")
+
+          ps_script = textwrap.dedent(f"""
+          $ErrorActionPreference = "Stop"
+
+          $installer = "C:\\Windows\\Temp\\AnyDesk.exe"
+          $installDir = "C:\\Program Files (x86)\\AnyDesk"
+          $exe = Join-Path $installDir "AnyDesk.exe"
+
+          Write-Host "Downloading AnyDesk..."
+          Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $installer
+
+          Write-Host "Installing AnyDesk silently..."
+          Start-Process -FilePath $installer -ArgumentList "--install `"$installDir`" --start-with-win --create-shortcuts --silent" -Wait
+
+          Start-Sleep -Seconds 10
+
+          if (-not (Test-Path $exe)) {{
+              throw "AnyDesk.exe not found at $exe"
+          }}
+
+          Write-Host "Starting AnyDesk service/client..."
+          Start-Process -FilePath $exe -ArgumentList "--start" -Wait
+
+          Write-Host "Setting Unattended Access password..."
+          $pwd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{pwd_b64}"))
+
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $exe
+          $psi.Arguments = "--set-password _unattended_access"
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.UseShellExecute = $false
+          $psi.CreateNoWindow = $true
+
+          $p = [System.Diagnostics.Process]::Start($psi)
+          $p.StandardInput.WriteLine($pwd)
+          $p.StandardInput.Close()
+          $p.WaitForExit()
+
+          $stdout = $p.StandardOutput.ReadToEnd()
+          $stderr = $p.StandardError.ReadToEnd()
+
+          if ($p.ExitCode -ne 0) {{
+              throw "Failed to set password. ExitCode=$($p.ExitCode) STDOUT=$stdout STDERR=$stderr"
+          }}
+
+          Write-Host "===== AnyDesk Services ====="
+          Get-Service | Where-Object {{ $_.Name -like "*AnyDesk*" -or $_.DisplayName -like "*AnyDesk*" }} | Format-Table -AutoSize
+
+          Write-Host "AnyDesk installation and configuration finished."
+          """)
+
+          r = s.run_ps(ps_script)
+          stdout = r.std_out.decode("utf-8", errors="replace")
+          stderr = r.std_err.decode("utf-8", errors="replace")
+
+          print("===== WinRM STDOUT =====")
+          print(stdout or "(empty)")
+          print("===== WinRM STDERR =====")
+          print(stderr or "(empty)")
+
+          if r.status_code != 0:
+              raise SystemExit(r.status_code)
+          PY
 
       - name: Display connection details and keep alive
         run: |
@@ -197,14 +273,12 @@ jobs:
           echo "    Server:   bore.pub"
           echo "    Port:     $BOR_WINRM_PORT"
           echo "    Username: runneradmin"
-          echo "    Password: WindowsRDP#2025"
-          echo "    (Use with any WinRM client, e.g. evil-winrm)"
-          echo ""
-          echo "Example using evil-winrm:"
-          echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
+          echo "    (Use with any WinRM client)"
           echo ""
           echo "[3] AnyDesk has been installed silently on the Windows machine."
-          echo "    You can now connect using AnyDesk (check the service status)."
+          echo "    Standard AnyDesk installs typically live at:"
+          echo "    C:\\Program Files (x86)\\AnyDesk\\AnyDesk.exe"
+          echo "    and AnyDesk supports setting unattended access from the CLI."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
