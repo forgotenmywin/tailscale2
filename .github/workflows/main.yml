@@ -33,7 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev sshpass openssh-client
 
           cargo install bore-cli
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
@@ -65,43 +65,58 @@ jobs:
           echo "===== WinRM Port Test ====="
           nc -zvw5 "$WIN_IP" 5985
 
-          echo "✅ Windows is reachable, ports 3389 (RDP) and 5985 (WinRM) are open"
+          echo "===== SSH Port Test ====="
+          nc -zvw5 "$WIN_IP" 22
+
+          echo "✅ Windows is reachable"
 
       - name: Start local forwards with socat
         run: |
           set -euo pipefail
           WIN_IP="${{ secrets.WINDOWS_IP }}"
 
-          # Forward RDP
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
           nohup socat -v -d -d TCP-LISTEN:3389,fork,reuseaddr TCP:$WIN_IP:3389 >/tmp/socat-rdp.log 2>&1 &
 
-          # Forward WinRM
           echo "Starting socat forward: 127.0.0.1:5985 -> $WIN_IP:5985"
           nohup socat -v -d -d TCP-LISTEN:5985,fork,reuseaddr TCP:$WIN_IP:5985 >/tmp/socat-winrm.log 2>&1 &
 
           sleep 5
-
           echo "===== Listening Ports ====="
           ss -tln || true
-
-          echo "===== Socat Logs ====="
-          echo "RDP log:"
-          cat /tmp/socat-rdp.log || true
-          echo "WinRM log:"
-          cat /tmp/socat-winrm.log || true
 
       - name: Test local forwards
         run: |
           set -euo pipefail
-
           echo "===== Local RDP Forward Test ====="
           nc -zvw5 127.0.0.1 3389
-
           echo "===== Local WinRM Forward Test ====="
           nc -zvw5 127.0.0.1 5985
-
           echo "✅ Both local forwards are working"
+
+      - name: Configure WinRM on Windows via SSH
+        run: |
+          set -euo pipefail
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
+
+          echo "Configuring WinRM on Windows via SSH..."
+          sshpass -p 'WindowsRDP#2025' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "runneradmin@$WIN_IP" -p 22 'powershell -Command "
+            # Enable WinRM
+            Enable-PSRemoting -Force
+            # Allow Basic authentication
+            Set-Item WSMan:\localhost\Service\Auth\Basic -Value $true -Force
+            # Allow unencrypted traffic (since we use Tailscale tunnel)
+            Set-Item WSMan:\localhost\Service\AllowUnencrypted -Value $true -Force
+            # Set TrustedHosts to * (allow all)
+            Set-Item WSMan:\localhost\Client\TrustedHosts -Value \"*\" -Force
+            # Restart WinRM service
+            Restart-Service WinRM -Force
+            # Add firewall rule for WinRM (just in case)
+            New-NetFirewallRule -Name \"WinRM-HTTP-In-TCP\" -DisplayName \"WinRM HTTP\" -Enabled True -Direction Inbound -Protocol TCP -LocalPort 5985 -Action Allow -ErrorAction SilentlyContinue
+            # Add runneradmin to WinRM group
+            Add-LocalGroupMember -Group \"WinRMRemoteWMIUsers__\" -Member \"runneradmin\" -ErrorAction SilentlyContinue
+            Write-Host \"WinRM configured successfully.\"
+          "' || { echo "❌ SSH configuration failed"; exit 1; }
 
       - name: Test WinRM connection locally
         run: |
@@ -135,38 +150,25 @@ jobs:
           done
 
           echo "===== Bore Logs ====="
-          echo "RDP Bore log:"
           cat /tmp/bore-rdp.log || true
-          echo "WinRM Bore log:"
           cat /tmp/bore-winrm.log || true
 
           BOR_RDP_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-rdp.log | tail -n1 | awk -F: '{print $2}')"
           BOR_WINRM_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-winrm.log | tail -n1 | awk -F: '{print $2}')"
 
-          if [ -z "${BOR_RDP_PORT:-}" ]; then
-            echo "❌ Bore did not publish a port for RDP"
-            exit 1
-          fi
-          if [ -z "${BOR_WINRM_PORT:-}" ]; then
-            echo "❌ Bore did not publish a port for WinRM"
+          if [ -z "${BOR_RDP_PORT:-}" ] || [ -z "${BOR_WINRM_PORT:-}" ]; then
+            echo "❌ Bore did not publish ports"
             exit 1
           fi
 
-          echo "Bore RDP port: $BOR_RDP_PORT"
-          echo "Bore WinRM port: $BOR_WINRM_PORT"
           echo "BOR_RDP_PORT=$BOR_RDP_PORT" >> "$GITHUB_ENV"
           echo "BOR_WINRM_PORT=$BOR_WINRM_PORT" >> "$GITHUB_ENV"
 
       - name: Smoke test Bore endpoints
         run: |
           set -euo pipefail
-
-          echo "===== Bore Smoke Test (RDP) ====="
           nc -zvw5 bore.pub "$BOR_RDP_PORT" || true
-
-          echo "===== Bore Smoke Test (WinRM) ====="
           nc -zvw5 bore.pub "$BOR_WINRM_PORT" || true
-
           echo "✅ Both Bore tunnels are up"
 
       - name: Install AnyDesk on Windows via WinRM
@@ -180,7 +182,7 @@ jobs:
             Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path -TimeoutSec 60
             Write-Host "Installing AnyDesk silently..."
             Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
-            Start-Sleep -Seconds 15
+            Start-Sleep -Seconds 10
             Write-Host "Checking service status:"
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
@@ -201,14 +203,11 @@ jobs:
           echo "    Port:     $BOR_WINRM_PORT"
           echo "    Username: runneradmin"
           echo "    Password: WindowsRDP#2025"
-          echo "    (Use with any WinRM client, e.g. evil-winrm)"
           echo ""
           echo "Example using evil-winrm:"
           echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
           echo ""
-          echo "[3] AnyDesk has been installed silently on the Windows machine."
-          echo "    You can now connect using AnyDesk (check the service status)."
-          echo ""
+          echo "[3] AnyDesk has been installed silently."
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
           while true; do
