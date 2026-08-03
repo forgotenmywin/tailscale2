@@ -8,11 +8,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    env:
-      WINDOWS_IP: ${{ secrets.WINDOWS_IP }}
-      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
-
     steps:
       - name: Install Tailscale
         run: |
@@ -26,7 +21,7 @@ jobs:
           sleep 8
 
           sudo tailscale up \
-            --authkey="$TAILSCALE_AUTH_KEY" \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
             --hostname="bore-tunnel"
 
           echo "===== Tailscale Status ====="
@@ -38,19 +33,20 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd python3 python3-pip
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev
 
           cargo install bore-cli
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
 
-          python3 -m pip install --upgrade pip
-          python3 -m pip install pywinrm
+          # Install evil-winrm with user install
+          gem install evil-winrm --no-document --user-install
+          echo "$HOME/.local/share/gem/ruby/3.2.0/bin" >> $GITHUB_PATH
 
       - name: Verify Windows reachability
         run: |
           set -euo pipefail
-          WIN_IP="$WINDOWS_IP"
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
 
           echo "======================================"
           echo "Windows IP: $WIN_IP"
@@ -62,7 +58,7 @@ jobs:
           fi
 
           echo "===== Ping Test ====="
-          ping -c 4 "$WIN_IP" || true
+          ping -c 4 "$WIN_IP"
 
           echo "===== RDP Port Test ====="
           nc -zvw5 "$WIN_IP" 3389
@@ -70,19 +66,21 @@ jobs:
           echo "===== WinRM Port Test ====="
           nc -zvw5 "$WIN_IP" 5985
 
-          echo "✅ Windows is reachable, ports 3389 and 5985 are open"
+          echo "✅ Windows is reachable, ports 3389 (RDP) and 5985 (WinRM) are open"
 
       - name: Start local forwards with socat
         run: |
           set -euo pipefail
-          WIN_IP="$WINDOWS_IP"
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
 
+          # Forward RDP
           echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
           nohup socat \
             TCP-LISTEN:3389,fork,reuseaddr \
             TCP:$WIN_IP:3389 \
             >/tmp/socat-rdp.log 2>&1 &
 
+          # Forward WinRM
           echo "Starting socat forward: 127.0.0.1:5985 -> $WIN_IP:5985"
           nohup socat \
             TCP-LISTEN:5985,fork,reuseaddr \
@@ -90,16 +88,41 @@ jobs:
             >/tmp/socat-winrm.log 2>&1 &
 
           sleep 3
+
+          echo "===== Listening Ports ====="
           ss -tln || true
+
+          echo "===== Socat Logs ====="
+          echo "RDP log:"
+          cat /tmp/socat-rdp.log || true
+          echo "WinRM log:"
+          cat /tmp/socat-winrm.log || true
+
+      - name: Test local forwards
+        run: |
+          set -euo pipefail
+
+          echo "===== Local RDP Forward Test ====="
+          nc -zvw5 127.0.0.1 3389
+
+          echo "===== Local WinRM Forward Test ====="
+          nc -zvw5 127.0.0.1 5985
+
+          echo "✅ Both local forwards are working"
 
       - name: Start Bore tunnels
         run: |
           set -euo pipefail
 
+          # Tunnel for RDP
+          echo "Starting Bore tunnel for RDP (3389)..."
           nohup bore local --to bore.pub 3389 >/tmp/bore-rdp.log 2>&1 &
+
+          # Tunnel for WinRM
+          echo "Starting Bore tunnel for WinRM (5985)..."
           nohup bore local --to bore.pub 5985 >/tmp/bore-winrm.log 2>&1 &
 
-          echo "Waiting for Bore ports..."
+          echo "Waiting for Bore to publish ports..."
           for i in $(seq 1 60); do
             if grep -q "listening at bore.pub:" /tmp/bore-rdp.log && grep -q "listening at bore.pub:" /tmp/bore-winrm.log; then
               break
@@ -107,367 +130,57 @@ jobs:
             sleep 1
           done
 
+          echo "===== Bore Logs ====="
+          echo "RDP Bore log:"
+          cat /tmp/bore-rdp.log || true
+          echo "WinRM Bore log:"
+          cat /tmp/bore-winrm.log || true
+
           BOR_RDP_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-rdp.log | tail -n1 | awk -F: '{print $2}')"
           BOR_WINRM_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore-winrm.log | tail -n1 | awk -F: '{print $2}')"
 
-          if [ -z "${BOR_RDP_PORT:-}" ] || [ -z "${BOR_WINRM_PORT:-}" ]; then
-            echo "❌ Bore did not publish ports"
-            echo "RDP log:"
-            cat /tmp/bore-rdp.log || true
-            echo "WinRM log:"
-            cat /tmp/bore-winrm.log || true
+          if [ -z "${BOR_RDP_PORT:-}" ]; then
+            echo "❌ Bore did not publish a port for RDP"
+            exit 1
+          fi
+          if [ -z "${BOR_WINRM_PORT:-}" ]; then
+            echo "❌ Bore did not publish a port for WinRM"
             exit 1
           fi
 
+          echo "Bore RDP port: $BOR_RDP_PORT"
+          echo "Bore WinRM port: $BOR_WINRM_PORT"
           echo "BOR_RDP_PORT=$BOR_RDP_PORT" >> "$GITHUB_ENV"
           echo "BOR_WINRM_PORT=$BOR_WINRM_PORT" >> "$GITHUB_ENV"
 
       - name: Smoke test Bore endpoints
         run: |
           set -euo pipefail
+
+          echo "===== Bore Smoke Test (RDP) ====="
           nc -zvw5 bore.pub "$BOR_RDP_PORT" || true
+
+          echo "===== Bore Smoke Test (WinRM) ====="
           nc -zvw5 bore.pub "$BOR_WINRM_PORT" || true
-          echo "✅ Bore tunnels are up"
 
-      - name: Test WinRM from GitHub runner
+          echo "✅ Both Bore tunnels are up"
+
+      - name: Install AnyDesk on Windows via WinRM
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          print("Connecting to WinRM...")
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          print("Running hostname...")
-          r = s.run_cmd("hostname")
-
-          print("STATUS:", r.status_code)
-          print("STDOUT:")
-          print(r.std_out.decode("utf-8", errors="replace"))
-          print("STDERR:")
-          print(r.std_err.decode("utf-8", errors="replace"))
-
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Stage RustDesk bootstrap script
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          ps = r'''
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
-
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-          $bootstrap = @'
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-          $release = Invoke-RestMethod -Headers @{ "User-Agent" = "GitHubActions" } -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
-
-          $asset = $release.assets | Where-Object {
-              $_.name -match '^rustdesk-.*-x86_64\.(exe|msi)$'
-          } | Select-Object -First 1
-
-          if (-not $asset) {
-              throw "RustDesk installer not found in latest release."
-          }
-
-          $installer = Join-Path $env:TEMP $asset.name
-          Write-Host "Downloading: $($asset.name)"
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer
-
-          if (-not (Test-Path $installer)) {
-              throw "Download failed."
-          }
-
-          Set-Content -Path "C:\Windows\Temp\rustdesk_installer_path.txt" -Value $installer -Encoding ASCII
-          Write-Host "Bootstrap step complete."
-          '@
-
-          Set-Content -Path "C:\Windows\Temp\rustdesk_bootstrap.ps1" -Value $bootstrap -Encoding UTF8
-          Write-Host "Bootstrap script written."
-          '''
-
-          r = s.run_ps(ps)
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Run RustDesk bootstrap script
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          r = s.run_cmd(
-              "powershell.exe",
-              [
-                  "-NoProfile",
-                  "-ExecutionPolicy", "Bypass",
-                  "-File", r"C:\Windows\Temp\rustdesk_bootstrap.ps1",
-              ],
-          )
-
-          print("===== BOOTSTRAP STDOUT =====")
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print("===== BOOTSTRAP STDERR =====")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
-
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Deploy RustDesk silently
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          ps = r'''
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
-
-          $marker = "C:\Windows\Temp\rustdesk_installer_path.txt"
-          if (-not (Test-Path $marker)) {
-              throw "Installer marker file was not found: $marker"
-          }
-
-          $installer = (Get-Content -Path $marker -ErrorAction Stop | Select-Object -First 1).Trim()
-          if (-not $installer) {
-              throw "Installer path inside marker file is empty."
-          }
-
-          if (-not (Test-Path $installer)) {
-              throw "Installer file does not exist: $installer"
-          }
-
-          Write-Host "Using installer: $installer"
-
-          if ($installer -like "*.msi") {
-              Write-Host "Running MSI deployment..."
-              Start-Process msiexec.exe -ArgumentList @("/i", "`"$installer`"", "/qn", "/norestart") -Wait -NoNewWindow
-          }
-          elseif ($installer -like "*.exe") {
-              Write-Host "Running EXE deployment..."
-              Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait -NoNewWindow
-          }
-          else {
-              throw "Installer is neither .exe nor .msi: $installer"
-          }
-
-          Write-Host "Deployment step finished."
-          '''
-
-          r = s.run_ps(ps)
-          print("===== DEPLOY STDOUT =====")
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print("===== DEPLOY STDERR =====")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
-
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Check RustDesk service
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          ps = r'''
-          $ErrorActionPreference = "Stop"
-
-          $svc = Get-Service | Where-Object {
-              $_.Name -match "Rust.*Desk" -or $_.DisplayName -match "Rust.*Desk"
-          } | Select-Object -First 1
-
-          if (-not $svc) {
-              Write-Host "RustDesk service not found. Listing matching processes..."
-              Get-Process | Where-Object { $_.ProcessName -match "rustdesk" } | Format-Table -AutoSize
-              exit 0
-          }
-
-          Write-Host "Service Name: $($svc.Name)"
-          Write-Host "Service Status: $($svc.Status)"
-
-          if ($svc.Status -ne "Running") {
-              Start-Service -Name $svc.Name
-              Start-Sleep -Seconds 5
-              $svc.Refresh()
-              Write-Host "Service Status After Start: $($svc.Status)"
-          }
-          '''
-
-          r = s.run_ps(ps)
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Set RustDesk password
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import base64
-          import sys
-          import winrm
-          import os
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-          rustdesk_password = os.environ["RUSTDESK_PASSWORD"]
-
-          if not rustdesk_password or len(rustdesk_password) < 8:
-              print("RUSTDESK_PASSWORD is empty or too short (min 8 chars).", file=sys.stderr)
-              sys.exit(1)
-
-          pwd_b64 = base64.b64encode(rustdesk_password.encode("utf-8")).decode("ascii")
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          ps = f'''
-          $ErrorActionPreference = "Stop"
-          $ProgressPreference = "SilentlyContinue"
-
-          function Get-RustDeskExe {{
-              $pf = [Environment]::GetFolderPath("ProgramFiles")
-              $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-
-              $candidates = @(
-                  (Join-Path $pf "RustDesk\\rustdesk.exe"),
-                  (Join-Path $pf86 "RustDesk\\rustdesk.exe")
-              )
-
-              foreach ($path in $candidates) {{
-                  if ($path -and (Test-Path $path)) {{
-                      return $path
-                  }}
-              }}
-
-              throw "RustDesk executable not found."
-          }}
-
-          $exe = Get-RustDeskExe
-          Write-Host "Using: $exe"
-
-          $pwd = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("{pwd_b64}"))
-          & $exe --password $pwd
-          if ($LASTEXITCODE -ne 0) {{
-              throw "RustDesk password command failed with exit code $LASTEXITCODE"
-          }}
-
-          Write-Host "Password set command completed."
-          '''
-
-          r = s.run_ps(ps)
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
-
-      - name: Get RustDesk ID
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import sys
-          import winrm
-
-          host = "http://127.0.0.1:5985/wsman"
-          user = "runneradmin"
-          password = "WindowsRDP#2025"
-
-          s = winrm.Session(host, auth=(user, password), transport="ntlm")
-
-          ps = r'''
-          $ErrorActionPreference = "Stop"
-
-          function Get-RustDeskExe {
-              $pf = [Environment]::GetFolderPath("ProgramFiles")
-              $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
-
-              $candidates = @(
-                  (Join-Path $pf "RustDesk\rustdesk.exe"),
-                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
-              )
-
-              foreach ($path in $candidates) {
-                  if ($path -and (Test-Path $path)) {
-                      return $path
-                  }
-              }
-
-              throw "RustDesk executable not found."
-          }
-
-          $exe = Get-RustDeskExe
-          Write-Host "Using: $exe"
-          Write-Host "Reading RustDesk ID..."
-          & $exe --get-id
-          '''
-
-          r = s.run_ps(ps)
-          out = r.std_out.decode("utf-8", errors="replace").strip()
-          err = r.std_err.decode("utf-8", errors="replace").strip()
-
-          print("===== RustDesk ID OUTPUT =====")
-          print(out or "(empty)")
-          print("===== RustDesk STDERR =====")
-          print(err or "(empty)")
-
-          if r.status_code != 0:
-              sys.exit(r.status_code)
-          PY
+          echo "Installing AnyDesk silently on Windows via WinRM..."
+          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' --no-ssl -c '
+            $path = "C:\Windows\Temp\AnyDesk.exe"
+            Write-Host "Downloading AnyDesk..."
+            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path
+            Write-Host "Installing AnyDesk silently..."
+            Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
+            Start-Sleep -Seconds 10
+            Write-Host "Checking service status:"
+            Get-Service AnyDesk* | Format-List
+            Write-Host "AnyDesk installation finished successfully!"
+          ' 2>&1 | grep -v "TERM\|Useless cert"
 
       - name: Display connection details and keep alive
         run: |
@@ -483,10 +196,14 @@ jobs:
           echo "    Server:   bore.pub"
           echo "    Port:     $BOR_WINRM_PORT"
           echo "    Username: runneradmin"
+          echo "    Password: WindowsRDP#2025"
+          echo "    (Use with any WinRM client, e.g. evil-winrm)"
           echo ""
-          echo "[3] RustDesk:"
-          echo "    Installed silently on the Windows machine."
-          echo "    Open the RustDesk app and connect using the ID printed above."
+          echo "Example using evil-winrm:"
+          echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
+          echo ""
+          echo "[3] AnyDesk has been installed silently on the Windows machine."
+          echo "    You can now connect using AnyDesk (check the service status)."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
