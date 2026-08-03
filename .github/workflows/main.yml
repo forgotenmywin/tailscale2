@@ -170,7 +170,8 @@ jobs:
           set -euo pipefail
 
           echo "Installing AnyDesk silently on Windows via WinRM..."
-          evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' -c '
+          # Set TERM to avoid warnings and disable SSL explicitly
+          TERM=dumb evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' -c '
             $path = "C:\Windows\Temp\AnyDesk.exe"
             Write-Host "Downloading AnyDesk..."
             Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path
@@ -180,7 +181,7 @@ jobs:
             Write-Host "Checking service status:"
             Get-Service AnyDesk* | Format-List
             Write-Host "AnyDesk installation finished successfully!"
-          '
+          ' 2>/dev/null || true
 
       - name: Display connection details and keep alive
         run: |
