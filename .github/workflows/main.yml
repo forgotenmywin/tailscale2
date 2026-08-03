@@ -33,11 +33,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd ruby ruby-dev
 
           cargo install bore-cli
           sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
           sudo chmod +x /usr/local/bin/bore
+
+          # Install evil-winrm for WinRM connections
+          gem install evil-winrm --no-document
 
       - name: Verify Windows reachability
         run: |
@@ -161,6 +164,23 @@ jobs:
 
           echo "✅ Both Bore tunnels are up"
 
+      - name: Install AnyDesk on Windows via WinRM
+        run: |
+          set -euo pipefail
+
+          echo "Installing AnyDesk silently on Windows via WinRM..."
+          evil-winrm -i 127.0.0.1 -p 5985 -u runneradmin -p 'WindowsRDP#2025' -c '
+            $path = "C:\Windows\Temp\AnyDesk.exe"
+            Write-Host "Downloading AnyDesk..."
+            Invoke-WebRequest -Uri "https://download.anydesk.com/AnyDesk.exe" -OutFile $path
+            Write-Host "Installing AnyDesk silently..."
+            Start-Process -FilePath $path -ArgumentList "--install C:\Program Files (x86)\AnyDesk --start-with-win --silent" -Wait
+            Start-Sleep -Seconds 10
+            Write-Host "Checking service status:"
+            Get-Service AnyDesk* | Format-List
+            Write-Host "AnyDesk installation finished successfully!"
+          '
+
       - name: Display connection details and keep alive
         run: |
           set -euo pipefail
@@ -180,6 +200,9 @@ jobs:
           echo ""
           echo "Example using evil-winrm:"
           echo "    evil-winrm -i bore.pub -p $BOR_WINRM_PORT -u runneradmin -p 'WindowsRDP#2025'"
+          echo ""
+          echo "[3] AnyDesk has been installed silently on the Windows machine."
+          echo "    You can now connect using AnyDesk (check the service status)."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
