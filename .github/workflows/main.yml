@@ -195,7 +195,7 @@ jobs:
               sys.exit(r.status_code)
           PY
 
-      - name: Download RustDesk installer
+      - name: Stage RustDesk bootstrap script
         run: |
           set -euo pipefail
 
@@ -208,13 +208,20 @@ jobs:
           user = os.environ["WINDOWS_USER"]
           password = os.environ["WINDOWS_PASSWORD"]
 
+          if not user or not password:
+              print("WINDOWS_USER or WINDOWS_PASSWORD is empty", file=sys.stderr)
+              sys.exit(1)
+
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
           ps = r'''
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          Write-Host "Fetching latest RustDesk release..."
+          $bootstrap = @'
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
           $release = Invoke-RestMethod -Headers @{ "User-Agent" = "GitHubActions" } -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
 
           $asset = $release.assets | Where-Object {
@@ -222,31 +229,72 @@ jobs:
           } | Select-Object -First 1
 
           if (-not $asset) {
-              throw "Could not find a RustDesk x86_64 .exe or .msi asset."
+              throw "RustDesk installer not found in latest release."
           }
 
           $installer = Join-Path $env:TEMP $asset.name
-          Write-Host "Asset: $($asset.name)"
-          Write-Host "Downloading to: $installer"
-
+          Write-Host "Downloading: $($asset.name)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $installer
 
           if (-not (Test-Path $installer)) {
-              throw "Installer download failed."
+              throw "Download failed."
           }
 
-          Set-Content -Path (Join-Path $env:TEMP 'rustdesk-installer-path.txt') -Value $installer -Encoding ASCII
-          Write-Host "Downloaded OK"
+          Set-Content -Path "C:\Windows\Temp\rustdesk_installer_path.txt" -Value $installer -Encoding ASCII
+          Write-Host "Bootstrap step complete."
+          '@
+
+          Set-Content -Path "C:\Windows\Temp\rustdesk_bootstrap.ps1" -Value $bootstrap -Encoding UTF8
+          Write-Host "Bootstrap script written to C:\Windows\Temp\rustdesk_bootstrap.ps1"
           '''
 
           r = s.run_ps(ps)
-          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
-          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
+          stdout = r.std_out.decode("utf-8", errors="replace")
+          stderr = r.std_err.decode("utf-8", errors="replace")
+
+          print("===== STDOUT =====")
+          print(stdout or "(empty)")
+          print("===== STDERR =====")
+          print(stderr or "(empty)")
+
           if r.status_code != 0:
               sys.exit(r.status_code)
           PY
 
-      - name: Install RustDesk silently
+      - name: Run RustDesk bootstrap script
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import os
+          import sys
+          import winrm
+
+          host = "http://127.0.0.1:5985/wsman"
+          user = os.environ["WINDOWS_USER"]
+          password = os.environ["WINDOWS_PASSWORD"]
+
+          s = winrm.Session(host, auth=(user, password), transport="ntlm")
+
+          r = s.run_cmd(
+              "powershell.exe",
+              [
+                  "-NoProfile",
+                  "-ExecutionPolicy", "Bypass",
+                  "-File", r"C:\Windows\Temp\rustdesk_bootstrap.ps1",
+              ],
+          )
+
+          print("===== BOOTSTRAP STDOUT =====")
+          print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
+          print("===== BOOTSTRAP STDERR =====")
+          print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
+
+          if r.status_code != 0:
+              sys.exit(r.status_code)
+          PY
+
+      - name: Deploy RustDesk silently
         run: |
           set -euo pipefail
 
@@ -265,7 +313,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          $marker = Join-Path $env:TEMP 'rustdesk-installer-path.txt'
+          $marker = "C:\Windows\Temp\rustdesk_installer_path.txt"
           if (-not (Test-Path $marker)) {
               throw "Installer marker file was not found: $marker"
           }
@@ -282,28 +330,31 @@ jobs:
           Write-Host "Using installer: $installer"
 
           if ($installer -like "*.msi") {
-              Write-Host "Installing MSI silently..."
+              Write-Host "Running MSI deployment..."
               Start-Process msiexec.exe -ArgumentList @("/i", "`"$installer`"", "/qn", "/norestart") -Wait -NoNewWindow
           }
           elseif ($installer -like "*.exe") {
-              Write-Host "Installing EXE silently..."
+              Write-Host "Running EXE deployment..."
               Start-Process -FilePath $installer -ArgumentList "--silent-install" -Wait -NoNewWindow
           }
           else {
               throw "Installer is neither .exe nor .msi: $installer"
           }
 
-          Write-Host "Install step finished."
+          Write-Host "Deployment step finished."
           '''
 
           r = s.run_ps(ps)
+          print("===== DEPLOY STDOUT =====")
           print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
+          print("===== DEPLOY STDERR =====")
           print(r.std_err.decode("utf-8", errors="replace") or "(empty)")
+
           if r.status_code != 0:
               sys.exit(r.status_code)
           PY
 
-      - name: Verify RustDesk service
+      - name: Check RustDesk service
         run: |
           set -euo pipefail
 
@@ -321,11 +372,12 @@ jobs:
           ps = r'''
           $ErrorActionPreference = "Stop"
 
-          Write-Host "Looking for RustDesk service..."
-          $svc = Get-Service | Where-Object { $_.Name -match "Rust.*Desk" -or $_.DisplayName -match "Rust.*Desk" } | Select-Object -First 1
+          $svc = Get-Service | Where-Object {
+              $_.Name -match "Rust.*Desk" -or $_.DisplayName -match "Rust.*Desk"
+          } | Select-Object -First 1
 
           if (-not $svc) {
-              Write-Host "RustDesk service not found yet. Listing related processes..."
+              Write-Host "RustDesk service not found. Listing matching processes..."
               Get-Process | Where-Object { $_.ProcessName -match "rustdesk" } | Format-Table -AutoSize
               exit 0
           }
@@ -339,8 +391,6 @@ jobs:
               $svc.Refresh()
               Write-Host "Service Status After Start: $($svc.Status)"
           }
-
-          Write-Host "Service check finished."
           '''
 
           r = s.run_ps(ps)
@@ -370,38 +420,38 @@ jobs:
 
           s = winrm.Session(host, auth=(user, password), transport="ntlm")
 
-          ps = r'''
+          ps = f'''
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          function Get-RustDeskExe {
+          function Get-RustDeskExe {{
               $pf = [Environment]::GetFolderPath("ProgramFiles")
               $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
               $candidates = @(
-                  (Join-Path $pf "RustDesk\rustdesk.exe"),
-                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
+                  (Join-Path $pf "RustDesk\\rustdesk.exe"),
+                  (Join-Path $pf86 "RustDesk\\rustdesk.exe")
               )
 
-              foreach ($path in $candidates) {
-                  if ($path -and (Test-Path $path)) {
+              foreach ($path in $candidates) {{
+                  if ($path -and (Test-Path $path)) {{
                       return $path
-                  }
-              }
+                  }}
+              }}
 
               throw "RustDesk executable not found."
-          }
+          }}
 
           $exe = Get-RustDeskExe
           Write-Host "Using: $exe"
 
-          & $exe --password "<<<PWD_B64>>>"
-          if ($LASTEXITCODE -ne 0) {
+          & $exe --password "{rustdesk_password}"
+          if ($LASTEXITCODE -ne 0) {{
               throw "RustDesk password command failed with exit code $LASTEXITCODE"
-          }
+          }}
 
           Write-Host "Password set command completed."
-          '''.replace("<<<PWD_B64>>>", rustdesk_password)
+          '''
 
           r = s.run_ps(ps)
           print(r.std_out.decode("utf-8", errors="replace") or "(empty)")
@@ -433,8 +483,8 @@ jobs:
               $pf86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
               $candidates = @(
-                  (Join-Path $pf "RustDesk\rustdesk.exe"),
-                  (Join-Path $pf86 "RustDesk\rustdesk.exe")
+                  (Join-Path $pf "RustDesk\\rustdesk.exe"),
+                  (Join-Path $pf86 "RustDesk\\rustdesk.exe")
               )
 
               foreach ($path in $candidates) {
@@ -456,11 +506,10 @@ jobs:
           out = r.std_out.decode("utf-8", errors="replace").strip()
           err = r.std_err.decode("utf-8", errors="replace").strip()
 
-          echo = print
-          echo("===== RustDesk ID OUTPUT =====")
-          echo(out or "(empty)")
-          echo("===== RustDesk STDERR =====")
-          echo(err or "(empty)")
+          print("===== RustDesk ID OUTPUT =====")
+          print(out or "(empty)")
+          print("===== RustDesk STDERR =====")
+          print(err or "(empty)")
 
           if r.status_code != 0:
               sys.exit(r.status_code)
@@ -483,7 +532,7 @@ jobs:
           echo ""
           echo "[3] RustDesk:"
           echo "    Installed silently on the Windows machine."
-          echo "    Use the RustDesk app and connect with the ID printed above."
+          echo "    Open the RustDesk app and connect using the ID printed above."
           echo ""
           echo "============================================================"
           echo "Tunnel is ready. Keeping job alive for 6 hours..."
