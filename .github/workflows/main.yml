@@ -1,146 +1,142 @@
-name: Headless Browser + RustDesk + Real Chromium
+name: RDP Tunnel via Bore (Ubuntu)
 
 on:
   workflow_dispatch:
 
 jobs:
-  browser-desktop:
+  tunnel:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    env:
-      DEBIAN_FRONTEND: noninteractive
-      DISPLAY: :99
-      RUSTDESK_PASSWORD: ChangeMe-12345!
-      START_URL: https://example.com
-      XDG_RUNTIME_DIR: /tmp/runtime-runner
-
     steps:
-      - name: Prepare runtime dir
+      - name: Install Tailscale
         run: |
-          set -euxo pipefail
-          mkdir -p "$XDG_RUNTIME_DIR"
-          chmod 700 "$XDG_RUNTIME_DIR"
+          set -euo pipefail
+          curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Update system
+      - name: Start and connect Tailscale
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          sudo tailscaled &
+          sleep 8
+
+          sudo tailscale up \
+            --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" \
+            --hostname="bore-tunnel"
+
+          echo "===== Tailscale Status ====="
+          sudo tailscale status || true
+          echo "===== Tailscale IP ====="
+          sudo tailscale ip -4 || true
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
           sudo apt-get update
+          sudo apt-get install -y cargo socat iputils-ping netcat-openbsd
 
-      - name: Install desktop base
-        run: |
-          set -euxo pipefail
-          sudo apt-get install -y \
-            ca-certificates \
-            curl \
-            gnupg \
-            xvfb \
-            xfce4 \
-            xfce4-goodies \
-            dbus-x11 \
-            x11-xserver-utils \
-            xauth \
-            procps \
-            python3 \
-            python3-pip
+          cargo install bore-cli
+          sudo cp ~/.cargo/bin/bore /usr/local/bin/bore
+          sudo chmod +x /usr/local/bin/bore
 
-      - name: Start virtual display
+      - name: Verify Windows reachability
         run: |
-          set -euxo pipefail
-          Xvfb :99 -screen 0 1280x720x24 -ac +extension RANDR +render -noreset >/tmp/xvfb.log 2>&1 &
+          set -euo pipefail
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
+
+          echo "======================================"
+          echo "Windows IP: $WIN_IP"
+          echo "======================================"
+
+          if [ -z "$WIN_IP" ]; then
+            echo "❌ WINDOWS_IP secret is empty"
+            exit 1
+          fi
+
+          echo "===== Ping Test ====="
+          ping -c 4 "$WIN_IP"
+
+          echo "===== RDP Port Test ====="
+          nc -zvw5 "$WIN_IP" 3389
+
+          echo "✅ Windows is reachable and port 3389 is open"
+
+      - name: Start local RDP forward with socat
+        run: |
+          set -euo pipefail
+          WIN_IP="${{ secrets.WINDOWS_IP }}"
+
+          echo "Starting socat forward: 127.0.0.1:3389 -> $WIN_IP:3389"
+          nohup socat \
+            TCP-LISTEN:3389,fork,reuseaddr \
+            TCP:$WIN_IP:3389 \
+            >/tmp/socat.log 2>&1 &
+
           sleep 3
 
-      - name: Start XFCE desktop
+          echo "===== Listening Ports ====="
+          ss -tln || true
+
+          echo "===== Socat Log ====="
+          cat /tmp/socat.log || true
+
+      - name: Test local forward
         run: |
-          set -euxo pipefail
-          DISPLAY=:99 dbus-run-session -- startxfce4 >/tmp/xfce.log 2>&1 &
-          sleep 10
+          set -euo pipefail
 
-      - name: Install RustDesk
+          echo "===== Local Forward Test ====="
+          nc -zvw5 127.0.0.1 3389
+
+          echo "===== RDP Handshake Test ====="
+          timeout 5 bash -c 'echo | nc 127.0.0.1 3389' || true
+
+          echo "✅ Local forward is working"
+
+      - name: Start Bore tunnel
         run: |
-          set -euxo pipefail
-          curl -fsSL https://api.github.com/repos/rustdesk/rustdesk/releases/latest -o /tmp/rustdesk-release.json
+          set -euo pipefail
 
-          python3 - <<'PY'
-          import json,re,pathlib
-          data=json.load(open('/tmp/rustdesk-release.json'))
-          for a in data.get("assets",[]):
-              name=a.get("name","")
-              if re.search(r'rustdesk-.*(x86_64|amd64)\.deb$',name):
-                  pathlib.Path('/tmp/rustdesk-url.txt').write_text(a["browser_download_url"])
-                  break
-          PY
+          echo "Starting Bore tunnel..."
+          nohup bore local --to bore.pub 3389 >/tmp/bore.log 2>&1 &
 
-          curl -fL "$(cat /tmp/rustdesk-url.txt)" -o /tmp/rustdesk.deb
-          sudo apt-get install -y /tmp/rustdesk.deb
-
-      - name: Start RustDesk
-        run: |
-          set -euxo pipefail
-          DISPLAY=:99 dbus-run-session -- nohup rustdesk --password "$RUSTDESK_PASSWORD" >/tmp/rustdesk.log 2>&1 &
-          sleep 20
-
-      - name: Print RustDesk ID
-        run: |
-          set -euxo pipefail
-          for i in $(seq 1 36); do
-            ID="$(rustdesk --get-id 2>/dev/null | tail -n 1 || true)"
-            if [ -n "$ID" ]; then
-              echo "RustDesk ID: $ID"
+          echo "Waiting for Bore to publish port..."
+          for i in $(seq 1 60); do
+            if grep -q "listening at bore.pub:" /tmp/bore.log; then
               break
             fi
-            sleep 5
+            sleep 1
           done
 
-      - name: Install Playwright and Chromium
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
+
+          BOR_PORT="$(grep -oE 'listening at bore\.pub:[0-9]+' /tmp/bore.log | tail -n1 | awk -F: '{print $2}')"
+
+          if [ -z "${BOR_PORT:-}" ]; then
+            echo "❌ Bore did not publish a port"
+            exit 1
+          fi
+
+          echo "Bore port: $BOR_PORT"
+          echo "BOR_PORT=$BOR_PORT" >> "$GITHUB_ENV"
+
+      - name: Smoke test Bore endpoint
         run: |
-          set -euxo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install playwright
-          python3 -m playwright install chromium
+          set -euo pipefail
 
-      - name: Start real Chromium window
+          echo "===== Bore Smoke Test ====="
+          nc -zvw5 bore.pub "$BOR_PORT" || true
+
+          echo "===== Bore Log ====="
+          cat /tmp/bore.log || true
+
+          echo "✅ Bore tunnel is up"
+
+      - name: Keep alive
         run: |
-          set -euxo pipefail
-
-          cat > /tmp/start_browser.py <<'PY'
-          import os,time
-          from playwright.sync_api import sync_playwright
-
-          url=os.environ.get("START_URL","https://example.com")
-
-          with sync_playwright() as p:
-              browser=p.chromium.launch(
-                  headless=False,
-                  args=[
-                      "--no-sandbox",
-                      "--disable-dev-shm-usage",
-                      "--start-maximized"
-                  ]
-              )
-
-              page=browser.new_page(viewport={"width":1280,"height":720})
-              page.goto(url,wait_until="domcontentloaded")
-              page.bring_to_front()
-
-              while True:
-                  time.sleep(60)
-          PY
-
-          DISPLAY=:99 dbus-run-session -- nohup python3 /tmp/start_browser.py >/tmp/chromium.log 2>&1 &
-
-      - name: Show logs
-        run: |
-          set -euxo pipefail
-
-          echo "=== RustDesk log ==="
-          tail -n 120 /tmp/rustdesk.log || true
-
-          echo "=== Chromium log ==="
-          tail -n 120 /tmp/chromium.log || true
-
-          echo "=== XFCE log ==="
-          tail -n 120 /tmp/xfce.log || true
-
-          echo "=== Xvfb log ==="
-          tail -n 120 /tmp/xvfb.log || true
+          set -euo pipefail
+          echo "Tunnel is ready. Keeping job alive..."
+          while true; do
+            echo "Alive: $(date)"
+            sleep 300
+          done
